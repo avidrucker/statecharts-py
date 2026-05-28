@@ -4,6 +4,9 @@ A faithful Python 3 port of [`fulcrologic/statecharts`](https://github.com/fulcr
 **W3C SCXML** structure and semantics without the XML, expressed as plain Python data,
 with swappable `DataModel` / `ExecutionModel` / `EventQueue` seams.
 
+👉 **New here? Start with the runnable demos in [`examples/`](./examples/)** — they're
+numbered in a recommended order, from the core engine to the advanced layers.
+
 See [`init_plan.md`](./init_plan.md) for the full feasibility analysis and roadmap that motivated this port.
 
 ## Status
@@ -43,7 +46,7 @@ Higher-level layers:
   timers are persisted. `DurableRuntime.start`/`enqueue`/`tick` drive it. SQLite gives
   durability + safe multi-process access on one machine; the same schema ports to
   Postgres (`SELECT ... FOR UPDATE SKIP LOCKED`) for true multi-node distribution.
-  See `examples/durable_workflow.py` for a restart-survival demo.
+  See `examples/05_durable_workflow.py` for a restart-survival demo.
 
 The scope from the original plan is now complete, including the durable event queue.
 
@@ -110,17 +113,24 @@ wm = process_event(env, wm, "start")       # -> new WorkingMemory
 ## Run it
 
 ```bash
-python3 run_tests.py               # 41 tests, zero dependencies
+python3 run_tests.py               # 43 tests, zero dependencies
 python3 tests/w3c/runner.py        # W3C conformance report
+```
 
-# runnable examples (see examples/README.md) — no install needed:
-python3 examples/payment_flow.py        # core: retries, timeout, guards
-python3 examples/invoke_demo.py         # <invoke> child statechart
-python3 examples/fulcro_store.py        # normalized store + actors/aliases
-python3 examples/async_traffic_light.py # AsyncSession, real-time timers
-python3 examples/durable_workflow.py    # SQLite durability across a restart
-python3 examples/visualize.py           # Mermaid / Graphviz output
-python3 examples/load_scxml.py          # load + run SCXML XML
+### Examples
+
+The [`examples/`](./examples/) folder has a runnable demo for every feature — each is
+self-contained and needs no install. They're **numbered in a recommended reading
+order** (core → structure → advanced); see [`examples/README.md`](./examples/README.md).
+
+```bash
+python3 examples/01_payment_flow.py        # core: retries, timeout, guards
+python3 examples/02_visualize.py           # Mermaid / Graphviz output
+python3 examples/03_load_scxml.py          # load + run SCXML XML
+python3 examples/04_async_traffic_light.py # AsyncSession, real-time timers
+python3 examples/05_durable_workflow.py    # SQLite durability across a restart
+python3 examples/06_invoke_demo.py         # <invoke> child statechart
+python3 examples/07_fulcro_store.py        # normalized store + actors/aliases
 ```
 
 (When `pytest` is available, `pytest` works too — tests are standard `test_*` functions.)
