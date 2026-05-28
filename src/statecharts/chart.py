@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .elements import (
     DataModel,
+    Invoke,
     OnEntry,
     OnExit,
     StateNode,
@@ -80,6 +81,7 @@ def _partition(children) -> dict:
     trans: List[Transition] = []
     entries: List[OnEntry] = []
     exits: List[OnExit] = []
+    invokes: List[Invoke] = []
     dm: Optional[DataModel] = None
     init: Optional[_Initial] = None
     for c in children:
@@ -91,6 +93,8 @@ def _partition(children) -> dict:
             entries.append(c)
         elif isinstance(c, OnExit):
             exits.append(c)
+        elif isinstance(c, Invoke):
+            invokes.append(c)
         elif isinstance(c, DataModel):
             dm = c
         elif isinstance(c, _Initial):
@@ -102,6 +106,7 @@ def _partition(children) -> dict:
         "trans": tuple(trans),
         "entries": tuple(entries),
         "exits": tuple(exits),
+        "invokes": tuple(invokes),
         "dm": dm,
         "init": init,
     }
@@ -131,6 +136,7 @@ def state(opts: Optional[dict] = None, *children) -> StateNode:
         datamodel=part["dm"],
         initial=init_targets,
         initial_content=init_content,
+        invokes=part["invokes"],
     )
 
 
@@ -145,6 +151,7 @@ def parallel(opts: Optional[dict] = None, *children) -> StateNode:
         on_entry=part["entries"],
         on_exit=part["exits"],
         datamodel=part["dm"],
+        invokes=part["invokes"],
     )
 
 

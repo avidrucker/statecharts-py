@@ -21,7 +21,7 @@ from ..chart import (
     statechart,
     transition,
 )
-from ..elements import Assign, Cancel, Foreach, If, Log, Raise, Send, StateNode
+from ..elements import Assign, Cancel, Foreach, If, Invoke, Log, Raise, Send, StateNode
 
 
 class UnsupportedConstruct(Exception):
@@ -219,9 +219,38 @@ def _parse_state_children(el):
             t = next(c for c in child if _local(c.tag) == "transition")
             children.append(initial(_targets(t.get("target")), *_parse_content(t)))
         elif tag == "invoke":
-            raise UnsupportedConstruct("<invoke> not supported")
+            children.append(_parse_invoke(child))
         # <donedata> handled by caller for <final>
     return children
+
+
+def _parse_invoke(el) -> Invoke:
+    params: List[Tuple[str, str]] = []
+    finalize: list = []
+    content_chart = None
+    for child in el:
+        ctag = _local(child.tag)
+        if ctag == "param":
+            params.append((child.get("name"), child.get("expr") or child.get("location")))
+        elif ctag == "finalize":
+            finalize = _parse_content(child)
+        elif ctag == "content":
+            inner = next((c for c in child if _local(c.tag) == "scxml"), None)
+            if inner is not None:
+                content_chart, _meta = _build_root(inner)
+    return Invoke(
+        type=el.get("type"),
+        type_expr=el.get("typeexpr"),
+        src=el.get("src"),
+        src_expr=el.get("srcexpr"),
+        id=el.get("id"),
+        id_location=el.get("idlocation"),
+        autoforward=(el.get("autoforward", "false") == "true"),
+        namelist=tuple((el.get("namelist") or "").split()),
+        params=tuple(params),
+        content_chart=content_chart,
+        finalize=tuple(finalize),
+    )
 
 
 def _parse_state(el) -> StateNode:
@@ -247,10 +276,7 @@ def _parse_state(el) -> StateNode:
     return state(opts, *_parse_state_children(el))
 
 
-def load_string(xml_text: str):
-    """Parse SCXML text. Returns ``(root_StateNode, meta)`` where ``meta`` has
-    ``name`` and ``binding`` ("early"|"late")."""
-    root_el = ET.fromstring(xml_text)
+def _build_root(root_el):
     if _local(root_el.tag) != "scxml":
         raise ValueError("Root element is not <scxml>")
     opts = {"id": "scxml"}
@@ -260,6 +286,12 @@ def load_string(xml_text: str):
     root = statechart(opts, *_parse_state_children(root_el))
     meta = {"name": root_el.get("name", ""), "binding": root_el.get("binding", "early")}
     return root, meta
+
+
+def load_string(xml_text: str):
+    """Parse SCXML text. Returns ``(root_StateNode, meta)`` where ``meta`` has
+    ``name`` and ``binding`` ("early"|"late")."""
+    return _build_root(ET.fromstring(xml_text))
 
 
 def load_file(path: str):

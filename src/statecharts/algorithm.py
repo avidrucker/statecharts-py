@@ -36,7 +36,13 @@ _logger = logging.getLogger("statecharts")
 
 
 class _ExecError(Exception):
-    """Internal: an executable-content error that should surface as error.execution."""
+    """Internal: an executable-content error that should surface as error.execution.
+
+    May carry the ``sendid`` of a failed <send> so it appears in the error event."""
+
+    def __init__(self, message: str, sendid: Optional[str] = None):
+        super().__init__(message)
+        self.sendid = sendid
 
 
 def _raise_error(run, name: str = "error.execution") -> None:
@@ -63,12 +69,14 @@ class _Run:
             self.history_value = {}
             self.running = False
             self.dm_initialized: Set[str] = set()
+            self.invocations: dict = {}
         else:
             self.configuration = set(wm.configuration)
             self.datamodel = dict(wm.datamodel)
             self.history_value = {k: set(v) for k, v in wm.history_value.items()}
             self.running = wm.running
             self.dm_initialized = set(wm.configuration)
+            self.invocations = dict(wm.invocations)
         self.internal_queue: deque = deque()
         self._event: Optional[Event] = None
 
@@ -91,6 +99,7 @@ class _Run:
             history_value={k: frozenset(v) for k, v in self.history_value.items()},
             running=self.running,
             initialized=True,
+            invocations=dict(self.invocations),
         )
 
 
@@ -120,10 +129,30 @@ def initialize(env: Environment) -> WorkingMemory:
         else:
             _apply_datamodel(run, node)
             run.dm_initialized.add(sid)
+    # Invoked children: overlay <param>/namelist seed data, but only onto variables
+    # the child actually declares (undeclared inputs are dropped, per SCXML).
+    for loc, val in env.extra.get("_seed_data", {}).items():
+        if loc in run.datamodel:
+            run.datamodel[loc] = val
     initial_t = Transition(target=root.initial, content=root.initial_content)
     _enter_states(run, [ET(root.id, initial_t)])
     _settle(run)
+    if not run.running:
+        _exit_interpreter(run)
+    _update_invocations(run)
     return run.to_wm()
+
+
+def _exit_interpreter(run: _Run) -> None:
+    """SCXML exitInterpreter: on termination, run the onexit handlers of remaining
+    active states in reverse document order.
+
+    Deviation: we keep the final configuration intact (rather than emptying it) so
+    callers can still inspect which final state was reached."""
+    for sid in run.chart.in_exit_order(list(run.configuration)):
+        node = run.chart.node(sid)
+        for blk in node.on_exit:
+            _run_block(run, blk.content)
 
 
 def process_event(env: Environment, wm: WorkingMemory, event) -> WorkingMemory:
@@ -134,11 +163,43 @@ def process_event(env: Environment, wm: WorkingMemory, event) -> WorkingMemory:
     if not run.running:
         return wm
     run._event = coerce_event(event)
-    enabled = _select_transitions(run, run._event)
+    ev = run._event
+    # An event from an invoked child runs that invocation's <finalize> first.
+    if ev.invokeid and ev.invokeid in run.invocations:
+        _run_block(run, run.invocations[ev.invokeid].finalize)
+    # autoforward external events to children that requested it
+    from .invoke import step_child
+
+    for invc in list(run.invocations.values()):
+        if invc.autoforward and not invc.done and ev.type != "platform":
+            step_child(run, invc, ev)
+    enabled = _select_transitions(run, ev)
     if enabled:
         _microstep(run, enabled)
     _settle(run)
+    if not run.running:
+        _exit_interpreter(run)
+    _update_invocations(run)
     return run.to_wm()
+
+
+def _update_invocations(run: _Run) -> None:
+    """After a macrostep: cancel invocations whose state exited, and start invokes
+    for newly-active states (SCXML defers invocation to after the macrostep)."""
+    from .invoke import start_invocation
+
+    c = run.chart
+    for invokeid in list(run.invocations):
+        if run.invocations[invokeid].state_id not in run.configuration:
+            del run.invocations[invokeid]  # state exited => cancel the invocation
+    invoked_states = {invc.state_id for invc in run.invocations.values()}
+    for sid in c.in_document_order(list(run.configuration)):
+        node = c.node(sid)
+        if node.invokes and sid not in invoked_states:
+            for inv in node.invokes:
+                invc = start_invocation(run, sid, inv)
+                if invc is not None:
+                    run.invocations[invc.invokeid] = invc
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +560,8 @@ def _run_block(run: _Run, items) -> None:
     (SCXML executable-content error semantics)."""
     try:
         _execute_content(run, items)
+    except _ExecError as exc:
+        run.internal_queue.append(Event("error.execution", type="platform", sendid=exc.sendid))
     except Exception:  # noqa: BLE001
         _raise_error(run)
 
@@ -524,6 +587,8 @@ def _send_data(run: _Run, item: Send):
         return _resolve(run, item.data)
     payload = {}
     for name in item.namelist:
+        if name not in run.datamodel:
+            raise _ExecError(f"<send> namelist references undeclared location {name!r}")
         payload[name] = run.datamodel.get(name)
     for name, value_expr in item.params:
         payload[name] = _ev(run, value_expr)
@@ -587,6 +652,23 @@ def _exec_one(run: _Run, item) -> None:
             run.internal_queue.append(
                 Event(name, data, type="internal", sendid=sendid, origintype=_SCXML_PROCESSOR)
             )
+        elif target == "#_parent":
+            # Child statechart -> parent session's external queue.
+            parent_q = env.extra.get("_parent_queue")
+            if parent_q is None:
+                _raise_error(run, "error.communication")
+            else:
+                parent_q.send(
+                    Event(name, data, origintype=_SCXML_PROCESSOR, sendid=sendid,
+                          invokeid=env.extra.get("_invokeid")),
+                    sendid=sendid,
+                )
+        elif str(target).startswith("#_") and target[2:] in run.invocations:
+            # Parent -> invoked child, addressed by "#_<invokeid>".
+            from .invoke import step_child
+
+            child_ev = Event(name, data, origintype=_SCXML_PROCESSOR, sendid=sendid)
+            step_child(run, run.invocations[target[2:]], child_ev)
         elif target in (None, "", f"#_scxml_{sid}") or target == sid:
             ev = Event(name, data, origintype=_SCXML_PROCESSOR, sendid=sendid)
             env.event_queue.send(ev, delay=delay if delay and delay > 0 else 0, sendid=sendid)
@@ -596,7 +678,7 @@ def _exec_one(run: _Run, item) -> None:
             _raise_error(run, "error.communication")
         else:
             # Malformed/illegal target -> error.execution, aborting the block.
-            raise _ExecError(f"illegal <send> target {target!r}")
+            raise _ExecError(f"illegal <send> target {target!r}", sendid=sendid)
     elif isinstance(item, Cancel):
         sendid = item.sendid if item.sendid is not None else _ev(run, item.sendid_expr)
         env.event_queue.cancel(sendid)

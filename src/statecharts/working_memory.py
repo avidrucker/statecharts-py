@@ -17,6 +17,10 @@ class WorkingMemory:
     history_value: Dict[str, FrozenSet[str]] = field(default_factory=dict)
     running: bool = False
     initialized: bool = False
+    # Active child invocations (invokeid -> runtime Invocation). NOTE: with live
+    # invocations the working memory holds child sessions and is no longer a plain
+    # serializable value; see invoke.py.
+    invocations: dict = field(default_factory=dict)
 
     def replace(self, **kw) -> "WorkingMemory":
         return replace(self, **kw)

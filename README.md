@@ -23,11 +23,13 @@ A working, faithful core engine. Implemented:
 Also implemented: an **SCXML XML loader** + an **ECMAScript-subset expression
 evaluator**, driving the **W3C conformance suite** (see below). Plus `<if>`/`<elseif>`/
 `<else>`, `<foreach>`, `<send>`/`<cancel>` with delays, `<donedata>`, early/late
-binding, `error.execution`/`error.communication` semantics, and system variables
-(`_event`, `_sessionid`, `_name`, `_ioprocessors`).
+binding, `error.execution`/`error.communication` semantics, system variables
+(`_event`, `_sessionid`, `_name`, `_ioprocessors`), and **`<invoke>`** — synchronous
+in-process child statecharts with `#_parent`/`#_<invokeid>` event routing,
+`done.invoke.*`, `param`/`namelist`, `autoforward`, and `finalize`.
 
-Deferred (see plan): service **invocations**/child charts, an **async**/durable event
-queue, the Fulcro-style normalized-store + actors/aliases layer, and **visualization**.
+Deferred (see plan): an **async**/durable event queue, the Fulcro-style
+normalized-store + actors/aliases layer, and **visualization**.
 
 ## W3C conformance
 
@@ -40,15 +42,17 @@ A test passes by reaching `<final id="pass">`.
 python3 tests/w3c/runner.py        # full report (add -v for INCOMPLETE/ERROR detail)
 ```
 
-Current result: **117 / 121 runnable tests pass (97%)**, 0 errors. The 38 skipped
-tests use `<invoke>`, `<script>`, or `<content src>` — deliberately out of the
-core-engine scope. The 4 remaining failures are narrow feature gaps (JS array
-prototype methods like `[].concat`, external `src` fetch, sendid-in-error-event).
+Current result: **150 / 156 runnable tests pass (96%)**, 0 errors. Only 3 tests are
+skipped (`<script>` ecmascript bodies, `<content src>`). The 6 remaining failures are
+narrow feature gaps: inline `function(){...}` IIFEs and JS array prototypes
+(`[].concat`) in the expression evaluator, scxml-as-a-data-value, external `src`
+fetch, and delayed-send cancellation across a terminating child session.
 
 Driving the suite surfaced (and fixed) several real bugs in the port — most
 notably **document order was numbered post-order instead of pre-order**, which had
-silently reversed state entry/exit ordering, and `<send>` with no target was routed
-to the *internal* queue instead of the *external* one.
+silently reversed state entry/exit ordering; `<send>` with no target was routed to
+the *internal* queue instead of the *external* one; and the same transition selected
+from two parallel regions executed twice (the "optimally enabled set" must be a set).
 
 ## Quick start
 
@@ -112,6 +116,7 @@ src/statecharts/
   convenience.py     # on / handle / choice / send_after
   simple.py          # Session facade
   ecma.py            # ECMAScript-subset execution model (for the W3C suite)
+  invoke.py          # synchronous <invoke> child-statechart sessions
   scxml/loader.py    # SCXML XML -> element tree
 tests/
   test_*.py          # native engine tests + W3C smoke guard

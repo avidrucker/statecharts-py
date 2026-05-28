@@ -54,6 +54,7 @@ def run_case(path: str, step_limit: int = 2000) -> Result:
     env.extra["_name"] = meta["name"]
     env.extra["_binding"] = meta["binding"]
     env.extra["_sessionid"] = f"session-{name}"
+    env.extra["_base_dir"] = CASES
     try:
         wm = initialize(env)
         steps = 0

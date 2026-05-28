@@ -169,6 +169,25 @@ HISTORY = "history"
 
 
 @dataclass(frozen=True)
+class Invoke:
+    """``<invoke>`` — run a child process (here: a child statechart) for the lifetime
+    of the invoking state. Started after the macrostep that enters the state; cancelled
+    when the state is exited."""
+
+    type: Optional[str] = None
+    type_expr: Optional[Union[Expr, str]] = None
+    src: Optional[str] = None
+    src_expr: Optional[Union[Expr, str]] = None
+    id: Optional[str] = None
+    id_location: Optional[str] = None
+    autoforward: bool = False
+    namelist: Tuple[str, ...] = ()
+    params: Tuple[Tuple[str, Union[Expr, str]], ...] = ()
+    content_chart: Optional["StateNode"] = None  # inline child <content><scxml>...
+    finalize: Tuple[Content, ...] = ()
+
+
+@dataclass(frozen=True)
 class StateNode:
     id: str
     kind: str = STATE
@@ -186,6 +205,8 @@ class StateNode:
     history_default: Optional[Transition] = None
     # done-data for <final> (evaluated to populate done.state.* event data)
     donedata: Optional[Expr] = None
+    # <invoke> children
+    invokes: Tuple["Invoke", ...] = ()
 
     @property
     def child_states(self) -> Tuple["StateNode", ...]:

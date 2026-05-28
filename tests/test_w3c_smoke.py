@@ -28,6 +28,10 @@ REPRESENTATIVE = {
     "test189": "#_internal send target",
     "test152": "illegal foreach array -> error.execution",
     "test496": "unknown session target -> error.communication",
+    "test226": "invoke child + param passing",
+    "test239": "invoke child -> done.invoke",
+    "test347": "bidirectional parent<->child event i/o (#_parent / #_child)",
+    "test192": "send to child via #_invokeid",
 }
 
 
