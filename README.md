@@ -20,9 +20,35 @@ A working, faithful core engine. Implemented:
 - **Delayed events** via an injectable clock (`send_after`, `ManualClock`).
 - Immutable, serializable **working memory** — the value that *is* a session (persist it between events).
 
-Deferred (see plan): the W3C IRP **conformance test harness** (next priority),
-service **invocations**/child charts, an **async**/durable event queue, the
-Fulcro-style normalized-store + actors/aliases layer, and **visualization**.
+Also implemented: an **SCXML XML loader** + an **ECMAScript-subset expression
+evaluator**, driving the **W3C conformance suite** (see below). Plus `<if>`/`<elseif>`/
+`<else>`, `<foreach>`, `<send>`/`<cancel>` with delays, `<donedata>`, early/late
+binding, `error.execution`/`error.communication` semantics, and system variables
+(`_event`, `_sessionid`, `_name`, `_ioprocessors`).
+
+Deferred (see plan): service **invocations**/child charts, an **async**/durable event
+queue, the Fulcro-style normalized-store + actors/aliases layer, and **visualization**.
+
+## W3C conformance
+
+The engine runs against the real **W3C SCXML IRP** mandatory automated ecmascript
+tests (vendored under `tests/w3c/cases/`, from the
+[alexzhornyak/SCXML-tutorial](https://github.com/alexzhornyak/SCXML-tutorial) mirror).
+A test passes by reaching `<final id="pass">`.
+
+```
+python3 tests/w3c/runner.py        # full report (add -v for INCOMPLETE/ERROR detail)
+```
+
+Current result: **117 / 121 runnable tests pass (97%)**, 0 errors. The 38 skipped
+tests use `<invoke>`, `<script>`, or `<content src>` — deliberately out of the
+core-engine scope. The 4 remaining failures are narrow feature gaps (JS array
+prototype methods like `[].concat`, external `src` fetch, sendid-in-error-event).
+
+Driving the suite surfaced (and fixed) several real bugs in the port — most
+notably **document order was numbered post-order instead of pre-order**, which had
+silently reversed state entry/exit ordering, and `<send>` with no target was routed
+to the *internal* queue instead of the *external* one.
 
 ## Quick start
 
@@ -85,4 +111,10 @@ src/statecharts/
   ops.py             # data-model operations (assign/delete)
   convenience.py     # on / handle / choice / send_after
   simple.py          # Session facade
+  ecma.py            # ECMAScript-subset execution model (for the W3C suite)
+  scxml/loader.py    # SCXML XML -> element tree
+tests/
+  test_*.py          # native engine tests + W3C smoke guard
+  w3c/runner.py      # full W3C conformance runner
+  w3c/cases/         # vendored W3C mandatory ecmascript tests
 ```

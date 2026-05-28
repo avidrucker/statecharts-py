@@ -17,20 +17,22 @@ class Event:
     (``platform`` | ``internal`` | ``external``)."""
 
     name: str
-    data: Mapping[str, Any] = field(default_factory=dict)
+    data: Any = None  # may be a dict, a scalar, or None (JS "undefined")
     type: str = "external"
     sendid: Optional[str] = None
     origin: Optional[str] = None
+    origintype: Optional[str] = None
     invokeid: Optional[str] = None
 
     def as_data(self) -> dict:
         """The ``_event`` view exposed to guard/action expressions."""
         return {
             "name": self.name,
-            "data": dict(self.data),
+            "data": self.data,
             "type": self.type,
             "sendid": self.sendid,
             "origin": self.origin,
+            "origintype": self.origintype,
             "invokeid": self.invokeid,
         }
 
@@ -39,9 +41,11 @@ def coerce_event(ev: Any, data: Optional[Mapping] = None) -> Event:
     """Accept an :class:`Event`, a name string, or anything stringifiable."""
     if isinstance(ev, Event):
         if data:
-            return Event(ev.name, {**ev.data, **data}, ev.type, ev.sendid, ev.origin, ev.invokeid)
+            base = dict(ev.data) if isinstance(ev.data, dict) else {}
+            base.update(data)
+            return Event(ev.name, base, ev.type, ev.sendid, ev.origin, ev.origintype, ev.invokeid)
         return ev
-    return Event(str(ev), dict(data or {}))
+    return Event(str(ev), dict(data) if data else None)
 
 
 def _descriptor_matches(descriptor: str, name: str) -> bool:

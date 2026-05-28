@@ -61,23 +61,57 @@ class Send:
     """``<send>`` — deliver an event, optionally after ``delay`` ms. ``target``
     of ``None`` / ``"#_internal"`` routes to this session.
 
-    Delayed delivery is realised by the event queue (see event_queue)."""
+    Delayed delivery is realised by the event queue (see event_queue).  The
+    ``*_expr`` fields and ``namelist``/``params``/``content`` support the SCXML
+    attribute forms where values are computed at send time."""
 
-    event: str
+    event: Optional[str] = None
     target: Optional[str] = None
     delay: int = 0
     id: Optional[str] = None
     data: Optional[Union[Expr, dict]] = None
+    type: Optional[str] = None
+    event_expr: Optional[Union[Expr, str]] = None
+    delay_expr: Optional[Union[Expr, str]] = None
+    target_expr: Optional[Union[Expr, str]] = None
+    type_expr: Optional[Union[Expr, str]] = None
+    id_location: Optional[str] = None
+    namelist: Tuple[str, ...] = ()
+    params: Tuple[Tuple[str, Union[Expr, str]], ...] = ()  # (name, value-expr)
+    content: Optional[Union[Expr, str]] = None
 
 
 @dataclass(frozen=True)
 class Cancel:
     """``<cancel sendid=.../>`` — cancel a pending delayed send."""
 
-    sendid: str
+    sendid: Optional[str] = None
+    sendid_expr: Optional[Union[Expr, str]] = None
+
+
+@dataclass(frozen=True)
+class If:
+    """``<if>/<elseif>/<else>`` — conditional executable content.
+
+    ``branches`` is an ordered list of ``(cond, content)``; the first branch whose
+    ``cond`` is truthy (or ``None``, the ``<else>``) runs."""
+
+    branches: Tuple[Tuple[Optional[Union[Expr, str]], Tuple], ...] = ()
+
+
+@dataclass(frozen=True)
+class Foreach:
+    """``<foreach>`` — iterate ``array`` binding each element to ``item`` (and the
+    index to ``index``), running ``content`` each time."""
+
+    array: Union[Expr, str]
+    item: str
+    index: Optional[str] = None
+    content: Tuple = ()
 
 
 # A unit of executable content is one of the above, or a bare callable.
+# (If/Foreach are defined below and are also valid content.)
 Content = Union[Script, Assign, Raise, Log, Send, Cancel, Expr]
 
 

@@ -10,6 +10,7 @@ Reference: https://www.w3.org/TR/scxml/#AlgorithmforSCXMLInterpretation
 """
 from __future__ import annotations
 
+import logging
 from collections import deque
 from typing import Iterable, List, NamedTuple, Optional, Set
 
@@ -17,6 +18,8 @@ from .chart import Chart
 from .elements import (
     Assign,
     Cancel,
+    Foreach,
+    If,
     Log,
     Raise,
     Script,
@@ -28,6 +31,17 @@ from .environment import Environment
 from .events import Event, coerce_event, event_matches
 from .ops import AssignOp, DeleteOp
 from .working_memory import WorkingMemory
+
+_logger = logging.getLogger("statecharts")
+
+
+class _ExecError(Exception):
+    """Internal: an executable-content error that should surface as error.execution."""
+
+
+def _raise_error(run, name: str = "error.execution") -> None:
+    """Enqueue a platform error event (error.execution / error.communication)."""
+    run.internal_queue.append(Event(name, type="platform"))
 
 
 class ET(NamedTuple):
@@ -61,6 +75,13 @@ class _Run:
     def data_view(self) -> dict:
         view = dict(self.datamodel)
         view["_event"] = self._event.as_data() if self._event else None
+        view["_configuration"] = frozenset(self.configuration)
+        view["_name"] = self.env.extra.get("_name", "")
+        sessionid = self.env.extra.get("_sessionid", "")
+        view["_sessionid"] = sessionid
+        view["_ioprocessors"] = {
+            "http://www.w3.org/TR/scxml/#SCXMLEventProcessor": {"location": sessionid}
+        }
         return view
 
     def to_wm(self) -> WorkingMemory:
@@ -79,13 +100,26 @@ class _Run:
 
 
 def initialize(env: Environment) -> WorkingMemory:
-    """Build the starting working memory: enter the document's initial states."""
+    """Build the starting working memory: enter the document's initial states.
+
+    Uses SCXML *early binding* (the default): every ``<data>`` in the document is
+    created and assigned at init, in document order, regardless of whether its
+    owning state is entered."""
     run = _Run(env)
     run.running = True
     root = run.chart.root
-    if root.datamodel:
-        _apply_datamodel(run, root)
-        run.dm_initialized.add(root.id)
+    late = env.extra.get("_binding", "early") == "late"
+    for sid in run.chart.in_document_order(list(run.chart.by_id.keys())):
+        node = run.chart.node(sid)
+        if not node.datamodel:
+            continue
+        if late and sid != root.id:
+            # Late binding: variables exist (undefined) at init; assigned on entry.
+            for loc in node.datamodel.data:
+                run.datamodel.setdefault(loc, None)
+        else:
+            _apply_datamodel(run, node)
+            run.dm_initialized.add(sid)
     initial_t = Transition(target=root.initial, content=root.initial_content)
     _enter_states(run, [ET(root.id, initial_t)])
     _settle(run)
@@ -112,9 +146,17 @@ def process_event(env: Environment, wm: WorkingMemory, event) -> WorkingMemory:
 # ---------------------------------------------------------------------------
 
 
+#: Safety net against a chart whose eventless/internal events never settle.
+MAX_SETTLE_ITERATIONS = 100_000
+
+
 def _settle(run: _Run) -> None:
     macrostep_done = False
+    iterations = 0
     while run.running and not macrostep_done:
+        iterations += 1
+        if iterations > MAX_SETTLE_ITERATIONS:
+            raise RuntimeError("run-to-completion did not settle (possible infinite loop)")
         enabled = _select_eventless_transitions(run)
         if not enabled:
             if not run.internal_queue:
@@ -130,7 +172,7 @@ def _settle(run: _Run) -> None:
 def _microstep(run: _Run, transitions: List[ET]) -> None:
     _exit_states(run, transitions)
     for et in transitions:
-        _execute_content(run, et.transition.content)
+        _run_block(run, et.transition.content)
     _enter_states(run, transitions)
 
 
@@ -142,7 +184,11 @@ def _microstep(run: _Run, transitions: List[ET]) -> None:
 def _cond_match(run: _Run, t: Transition) -> bool:
     if t.cond is None:
         return True
-    return bool(run.env.execution_model.run(run.env, run.data_view(), t.cond))
+    try:
+        return bool(run.env.execution_model.run(run.env, run.data_view(), t.cond))
+    except Exception:  # noqa: BLE001  (SCXML: guard error -> false + error.execution)
+        _raise_error(run)
+        return False
 
 
 def _select_transitions(run: _Run, event: Event) -> List[ET]:
@@ -156,7 +202,9 @@ def _select_transitions(run: _Run, event: Event) -> List[ET]:
                 break
             for t in c.node(sid).transitions:
                 if t.event is not None and event_matches(t.event, event.name) and _cond_match(run, t):
-                    enabled.append(ET(sid, t))
+                    et = ET(sid, t)
+                    if et not in enabled:  # enabledTransitions is a SET
+                        enabled.append(et)
                     found = True
                     break
     return _remove_conflicting_transitions(run, enabled)
@@ -173,7 +221,9 @@ def _select_eventless_transitions(run: _Run) -> List[ET]:
                 break
             for t in c.node(sid).transitions:
                 if t.event is None and _cond_match(run, t):
-                    enabled.append(ET(sid, t))
+                    et = ET(sid, t)
+                    if et not in enabled:  # enabledTransitions is a SET
+                        enabled.append(et)
                     found = True
                     break
     return _remove_conflicting_transitions(run, enabled)
@@ -293,7 +343,7 @@ def _exit_states(run: _Run, transitions: List[ET]) -> None:
     for sid in c.in_exit_order(to_exit):
         node = c.node(sid)
         for blk in node.on_exit:
-            _execute_content(run, blk.content)
+            _run_block(run, blk.content)
         run.configuration.discard(sid)
 
 
@@ -378,11 +428,11 @@ def _enter_states(run: _Run, transitions: List[ET]) -> None:
             _apply_datamodel(run, node)
             run.dm_initialized.add(sid)
         for blk in node.on_entry:
-            _execute_content(run, blk.content)
+            _run_block(run, blk.content)
         if sid in default_entry:
-            _execute_content(run, node.initial_content)
+            _run_block(run, node.initial_content)
         if sid in default_hist:
-            _execute_content(run, default_hist[sid])
+            _run_block(run, default_hist[sid])
         if c.is_final(sid):
             parent = c.parent_id(sid)
             if parent is None or c.is_scxml(parent):
@@ -427,14 +477,30 @@ def _apply_datamodel(run: _Run, node: StateNode) -> None:
     if not node.datamodel:
         return
     for loc, expr in node.datamodel.data.items():
-        val = run.env.execution_model.run(run.env, run.data_view(), expr) if callable(expr) else expr
-        run.datamodel[loc] = val
+        try:
+            run.datamodel[loc] = run.env.execution_model.run(run.env, run.data_view(), expr)
+        except Exception:  # noqa: BLE001  (illegal <data expr> -> undefined + error.execution)
+            run.datamodel[loc] = None
+            _raise_error(run)
 
 
-def _eval_donedata(run: _Run, node: StateNode) -> dict:
+def _eval_donedata(run: _Run, node: StateNode):
     if node.donedata is None:
-        return {}
-    return run.env.execution_model.run(run.env, run.data_view(), node.donedata) or {}
+        return None  # no <donedata> => done event has undefined data
+    try:
+        return run.env.execution_model.run(run.env, run.data_view(), node.donedata) or None
+    except Exception:  # noqa: BLE001
+        _raise_error(run)
+        return None
+
+
+def _run_block(run: _Run, items) -> None:
+    """Execute a content block; an error aborts the block and raises error.execution
+    (SCXML executable-content error semantics)."""
+    try:
+        _execute_content(run, items)
+    except Exception:  # noqa: BLE001
+        _raise_error(run)
 
 
 def _execute_content(run: _Run, items) -> None:
@@ -442,30 +508,113 @@ def _execute_content(run: _Run, items) -> None:
         _exec_one(run, item)
 
 
+_SCXML_PROCESSOR = "http://www.w3.org/TR/scxml/#SCXMLEventProcessor"
+
+
+def _ev(run: _Run, expr):
+    """Evaluate an expression (string/callable/literal) via the execution model."""
+    return run.env.execution_model.run(run.env, run.data_view(), expr)
+
+
+def _send_data(run: _Run, item: Send):
+    """Build the event payload for a <send>/<raise> from data/content/namelist/params."""
+    if item.content is not None:
+        return _ev(run, item.content)
+    if item.data is not None:
+        return _resolve(run, item.data)
+    payload = {}
+    for name in item.namelist:
+        payload[name] = run.datamodel.get(name)
+    for name, value_expr in item.params:
+        payload[name] = _ev(run, value_expr)
+    return payload if (item.namelist or item.params) else None
+
+
 def _exec_one(run: _Run, item) -> None:
     env = run.env
     if isinstance(item, Script):
-        _apply_ops(run, env.execution_model.run(env, run.data_view(), item.expr))
+        _apply_ops(run, _ev(run, item.expr))
     elif isinstance(item, Assign):
-        val = item.expr(env, run.data_view()) if callable(item.expr) else item.expr
-        run.datamodel = env.data_model.transact(run.datamodel, [AssignOp(item.location, val)])
+        root = item.location.split(".")[0].split("[")[0]
+        if root.startswith("_"):
+            # System variables (_event, _sessionid, _name, _ioprocessors, ...) are read-only.
+            raise _ExecError(f"cannot assign to system variable {item.location!r}")
+        if root not in run.datamodel:
+            # SCXML: assignment to an undeclared location is an error.
+            raise _ExecError(f"assign to undeclared location {item.location!r}")
+        run.datamodel = env.data_model.transact(
+            run.datamodel, [AssignOp(item.location, _ev(run, item.expr))]
+        )
     elif isinstance(item, Raise):
         run.internal_queue.append(Event(item.event, _resolve(run, item.data), type="internal"))
     elif isinstance(item, Log):
         label = item.label or "log"
-        val = item.expr(env, run.data_view()) if callable(item.expr) else item.expr
-        print(f"[{label}] {val}")
+        _logger.debug("[%s] %s", label, _ev(run, item.expr))
+    elif isinstance(item, If):
+        for cond, content in item.branches:
+            if cond is None or bool(_ev(run, cond)):
+                _execute_content(run, content)
+                break
+    elif isinstance(item, Foreach):
+        array = _ev(run, item.array)
+        if not isinstance(array, (list, tuple)):
+            raise _ExecError(f"<foreach> array is not iterable: {array!r}")
+        if not (isinstance(item.item, str) and item.item.isidentifier()):
+            raise _ExecError(f"<foreach> item is not a valid location: {item.item!r}")
+        for i, elem in enumerate(list(array)):  # copy: mutating source won't affect us
+            run.datamodel[item.item] = elem
+            if item.index is not None:
+                run.datamodel[item.index] = i
+            _execute_content(run, item.content)
     elif isinstance(item, Send):
-        data = _resolve(run, item.data)
-        if item.delay and item.delay > 0:
-            env.event_queue.send(Event(item.event, data), delay=item.delay, sendid=item.id)
-        elif item.target in (None, "#_internal"):
-            run.internal_queue.append(Event(item.event, data, type="internal"))
+        name = item.event if item.event is not None else _ev(run, item.event_expr)
+        data = _send_data(run, item)
+        sendid = item.id
+        if sendid is None and item.id_location is not None:
+            sendid = f"sendid-{id(item)}"
+            run.datamodel[item.id_location] = sendid
+        delay = item.delay
+        if item.delay_expr is not None:
+            delay = _parse_delay(_ev(run, item.delay_expr))
+        send_type = item.type if item.type_expr is None else _ev(run, item.type_expr)
+        if send_type not in (None, "", "scxml", _SCXML_PROCESSOR):
+            raise _ExecError(f"unsupported <send> type {send_type!r}")
+        target = item.target if item.target_expr is None else _ev(run, item.target_expr)
+        sid = env.extra.get("_sessionid", "")
+        if target == "#_internal":
+            # Only "#_internal" routes to the internal queue. A <send> with no
+            # target goes to this session's *external* queue (unlike <raise>).
+            run.internal_queue.append(
+                Event(name, data, type="internal", sendid=sendid, origintype=_SCXML_PROCESSOR)
+            )
+        elif target in (None, "", f"#_scxml_{sid}") or target == sid:
+            ev = Event(name, data, origintype=_SCXML_PROCESSOR, sendid=sendid)
+            env.event_queue.send(ev, delay=delay if delay and delay > 0 else 0, sendid=sendid)
+        elif str(target).startswith("#_scxml_"):
+            # Well-formed target naming an unknown session -> cannot dispatch.
+            # error.communication is async and does NOT abort the block.
+            _raise_error(run, "error.communication")
         else:
-            env.event_queue.send(Event(item.event, data), sendid=item.id)
+            # Malformed/illegal target -> error.execution, aborting the block.
+            raise _ExecError(f"illegal <send> target {target!r}")
     elif isinstance(item, Cancel):
-        env.event_queue.cancel(item.sendid)
+        sendid = item.sendid if item.sendid is not None else _ev(run, item.sendid_expr)
+        env.event_queue.cancel(sendid)
     elif callable(item):
         _apply_ops(run, item(env, run.data_view()))
     else:
         raise TypeError(f"Not executable content: {item!r}")
+
+
+def _parse_delay(spec) -> int:
+    """Parse an SCXML delay (``"1s"``, ``"1.5s"``, ``".5s"``, ``"100ms"``) to ms."""
+    if spec is None:
+        return 0
+    if isinstance(spec, (int, float)):
+        return int(spec)
+    s = str(spec).strip()
+    if s.endswith("ms"):
+        return int(float(s[:-2]))
+    if s.endswith("s"):
+        return int(float(s[:-1]) * 1000)
+    return int(float(s))

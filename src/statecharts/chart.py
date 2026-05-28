@@ -213,16 +213,18 @@ class Chart:
             nid = ".".join(path)
         if nid in self.by_id:
             raise ValueError(f"Duplicate state id: {nid!r}")
+        # Assign document order in PRE-ORDER (parent before its children), matching
+        # SCXML's "document order". Recurse into children afterward.
+        order = self._order
+        self._order += 1
         new_children = []
-        # assign id first so children reference a stable parent
         for i, child in enumerate(node.children):
             child_path = path + [child.id or f"{child.kind}{i}"]
             new_children.append(self._index(child, nid, child_path))
         node = dataclasses.replace(node, id=nid, children=tuple(new_children))
         self.by_id[nid] = node
         self.parent[nid] = parent_id
-        self.doc_order[nid] = self._order
-        self._order += 1
+        self.doc_order[nid] = order
         return node
 
     def _resolve_defaults(self, node: StateNode) -> None:
