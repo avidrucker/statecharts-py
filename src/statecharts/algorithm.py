@@ -173,7 +173,7 @@ def process_event(env: Environment, wm: WorkingMemory, event) -> WorkingMemory:
     if ev.invokeid and ev.invokeid in run.invocations:
         _run_block(run, run.invocations[ev.invokeid].finalize)
     # autoforward external events to children that requested it
-    from .invoke import step_child
+    from .invocations import step_child
 
     for invc in list(run.invocations.values()):
         if invc.autoforward and not invc.done and ev.type != "platform":
@@ -191,7 +191,7 @@ def process_event(env: Environment, wm: WorkingMemory, event) -> WorkingMemory:
 def _update_invocations(run: _Run) -> None:
     """After a macrostep: cancel invocations whose state exited, and start invokes
     for newly-active states (SCXML defers invocation to after the macrostep)."""
-    from .invoke import start_invocation
+    from .invocations import start_invocation
 
     c = run.chart
     for invokeid in list(run.invocations):
@@ -680,7 +680,7 @@ def _exec_one(run: _Run, item) -> None:
                 )
         elif str(target).startswith("#_") and target[2:] in run.invocations:
             # Parent -> invoked child, addressed by "#_<invokeid>".
-            from .invoke import step_child
+            from .invocations import step_child
 
             child_ev = Event(name, data, origintype=_SCXML_PROCESSOR, sendid=sendid)
             step_child(run, run.invocations[target[2:]], child_ev)

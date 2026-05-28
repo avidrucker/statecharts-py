@@ -179,6 +179,29 @@ def history(opts: Optional[dict] = None, *children) -> StateNode:
     )
 
 
+def invoke(opts: Optional[dict] = None) -> Invoke:
+    """Build an ``<invoke>`` for the Python DSL.
+
+    ``opts`` keys: ``content`` (a child statechart ``StateNode`` for inline invocation),
+    ``src``/``srcexpr``, ``id``/``idlocation``, ``type``, ``autoforward`` (bool),
+    ``namelist`` (names), ``params`` (``[(name, value_or_callable), ...]``), and
+    ``finalize`` (executable-content tuple)."""
+    opts = opts or {}
+    return Invoke(
+        type=opts.get("type"),
+        type_expr=opts.get("typeexpr"),
+        src=opts.get("src"),
+        src_expr=opts.get("srcexpr"),
+        id=opts.get("id"),
+        id_location=opts.get("idlocation"),
+        autoforward=bool(opts.get("autoforward", False)),
+        namelist=tuple(opts.get("namelist", ())),
+        params=tuple(opts.get("params", ())),
+        content_chart=opts.get("content"),
+        finalize=tuple(opts.get("finalize", ())),
+    )
+
+
 def statechart(opts: Optional[dict] = None, *children) -> StateNode:
     opts = opts or {}
     part = _partition(children)

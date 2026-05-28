@@ -23,6 +23,9 @@ class Session:
             raise TypeError("chart must be a StateNode or Chart")
         self.env = env or make_env(chart, **env_kwargs)
         self.wm: WorkingMemory = initialize(self.env, data)
+        # initialize() may start invokes that enqueue events (e.g. a child that
+        # finishes immediately -> done.invoke); deliver any that are already due.
+        self._drain_delayed()
 
     @property
     def configuration(self) -> FrozenSet[str]:

@@ -110,8 +110,17 @@ wm = process_event(env, wm, "start")       # -> new WorkingMemory
 ## Run it
 
 ```bash
-python3 run_tests.py          # 23 tests, zero dependencies
-python3 examples/payment_flow.py
+python3 run_tests.py               # 41 tests, zero dependencies
+python3 tests/w3c/runner.py        # W3C conformance report
+
+# runnable examples (see examples/README.md) — no install needed:
+python3 examples/payment_flow.py        # core: retries, timeout, guards
+python3 examples/invoke_demo.py         # <invoke> child statechart
+python3 examples/fulcro_store.py        # normalized store + actors/aliases
+python3 examples/async_traffic_light.py # AsyncSession, real-time timers
+python3 examples/durable_workflow.py    # SQLite durability across a restart
+python3 examples/visualize.py           # Mermaid / Graphviz output
+python3 examples/load_scxml.py          # load + run SCXML XML
 ```
 
 (When `pytest` is available, `pytest` works too — tests are standard `test_*` functions.)
@@ -132,7 +141,7 @@ src/statecharts/
   convenience.py     # on / handle / choice / send_after
   simple.py          # Session facade
   ecma.py            # ECMAScript-subset execution model (for the W3C suite)
-  invoke.py          # synchronous <invoke> child-statechart sessions
+  invocations.py     # synchronous <invoke> child-statechart sessions
   aio.py             # AsyncSession: asyncio runtime (real-time delayed sends)
   store.py           # normalized store + actors/aliases (Fulcro-style app state)
   durable.py         # SQLite durable event queue + session store + DurableRuntime
