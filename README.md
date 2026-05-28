@@ -37,11 +37,15 @@ Higher-level layers:
   `assoc_alias`/`set_actor` ops and `resolve_actors`/`resolve_aliases` helpers. The
   path toward porting Fulcro-style statechart-driven apps to Python.
 - **Visualization** (`viz.py`) — `to_mermaid` and `to_dot` renderers.
+- **Durable sessions** (`durable.py`) — a SQLite-backed event queue + session store,
+  so a workflow can wait for hours/days **across process restarts**. Charts are
+  registered by name (`ChartRegistry`); only JSON-able working memory and pending
+  timers are persisted. `DurableRuntime.start`/`enqueue`/`tick` drive it. SQLite gives
+  durability + safe multi-process access on one machine; the same schema ports to
+  Postgres (`SELECT ... FOR UPDATE SKIP LOCKED`) for true multi-node distribution.
+  See `examples/durable_workflow.py` for a restart-survival demo.
 
-The scope from the original plan is now complete. The only remaining deferred item
-is a *durable/distributed* event queue (the in-memory queue and the protocol seam to
-swap in a durable one both exist; a concrete Redis/Postgres-backed implementation is
-left as an integration exercise).
+The scope from the original plan is now complete, including the durable event queue.
 
 ## W3C conformance
 
@@ -131,6 +135,7 @@ src/statecharts/
   invoke.py          # synchronous <invoke> child-statechart sessions
   aio.py             # AsyncSession: asyncio runtime (real-time delayed sends)
   store.py           # normalized store + actors/aliases (Fulcro-style app state)
+  durable.py         # SQLite durable event queue + session store + DurableRuntime
   viz.py             # to_mermaid / to_dot chart renderers
   scxml/loader.py    # SCXML XML -> element tree
 tests/
