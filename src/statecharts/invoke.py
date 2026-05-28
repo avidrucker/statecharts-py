@@ -136,13 +136,19 @@ def start_invocation(run, state_id: str, inv: Invoke) -> Optional[Invocation]:
 def _drain_child(run, invc: Invocation) -> None:
     """Pump the child's own (delayed) queue, then emit done.invoke if it finished."""
     eq = invc.env.event_queue
+    parent_q = run.env.event_queue
     while invc.wm.running:
         due = eq.tick() if hasattr(eq, "tick") else []
         if not due:
             break
         from .algorithm import process_event
+        from dataclasses import replace
 
         for ev in due:
+            if ev.origin == "#_parent":
+                # a delayed child->parent send that came due while the child is alive
+                parent_q.send(replace(ev, origin=None))
+                continue
             invc.wm = process_event(invc.env, invc.wm, ev)
             if not invc.wm.running:
                 break

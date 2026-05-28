@@ -6,6 +6,7 @@ conformance runner can *skip* (not fail) those tests, keeping the pass rate hone
 """
 from __future__ import annotations
 
+import os
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
 
@@ -159,10 +160,24 @@ def _parse_if(el) -> If:
 # ---------------------------------------------------------------------------
 
 
+def _src_loader(src: str):
+    """A (env, data) callable that loads <data src=...> and evaluates its contents."""
+    def load(env, data):
+        path = src[len("file:"):] if src.startswith("file:") else src
+        if not os.path.isabs(path):
+            path = os.path.join(env.extra.get("_base_dir", ""), path)
+        with open(path, "r", encoding="utf-8") as fh:
+            return env.execution_model.run(env, data, fh.read().strip())
+    return load
+
+
 def _parse_datamodel(el):
     data = {}
     for d in el:
         if _local(d.tag) != "data":
+            continue
+        if d.get("src") is not None:
+            data[d.get("id")] = _src_loader(d.get("src"))
             continue
         expr = d.get("expr")
         if expr is None and d.text and d.text.strip():

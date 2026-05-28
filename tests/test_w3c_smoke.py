@@ -32,6 +32,9 @@ REPRESENTATIVE = {
     "test239": "invoke child -> done.invoke",
     "test347": "bidirectional parent<->child event i/o (#_parent / #_child)",
     "test192": "send to child via #_invokeid",
+    "test552": "<data src> loads initial value from a file",
+    "test525": "JS array <foreach> shallow copy + [].concat",
+    "test187": "delayed cross-session send dies with the child",
 }
 
 

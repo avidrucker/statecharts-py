@@ -10,9 +10,44 @@ inline ``function(){...}`` IIFEs, ternaries, full ``Array``/``String`` prototype
 """
 from __future__ import annotations
 
+import ast
 import math
 import re
 from typing import Any
+
+
+class JSArray(list):
+    """A list with the few JS Array members the conformance expressions use."""
+
+    def concat(self, *args):
+        out = JSArray(self)
+        for a in args:
+            if isinstance(a, (list, tuple)):
+                out.extend(a)
+            else:
+                out.append(a)
+        return out
+
+    def push(self, *items):
+        self.extend(items)
+        return len(self)
+
+    def indexOf(self, value):
+        try:
+            return self.index(value)
+        except ValueError:
+            return -1
+
+    def join(self, sep=","):
+        return sep.join(str(x) for x in self)
+
+    def slice(self, start=0, end=None):
+        return JSArray(self[start:end])
+
+    def __getattr__(self, name):
+        if name == "length":
+            return len(self)
+        raise AttributeError(name)
 
 
 class JSObject(dict):
@@ -31,10 +66,12 @@ class JSObject(dict):
 
 
 def to_js(value: Any) -> Any:
-    if isinstance(value, JSObject):
+    if isinstance(value, (JSObject, JSArray)):
         return value
     if isinstance(value, dict):
         return JSObject(value)
+    if isinstance(value, list):
+        return JSArray(value)
     return value
 
 
@@ -89,14 +126,32 @@ class EcmaError(Exception):
     pass
 
 
+class _ListToJSArray(ast.NodeTransformer):
+    """Rewrite list literals ``[...]`` to ``JSArray([...])`` so JS array methods work."""
+
+    def visit_List(self, node):  # noqa: N802
+        self.generic_visit(node)
+        return ast.Call(
+            func=ast.Name(id="JSArray", ctx=ast.Load()),
+            args=[ast.List(elts=node.elts, ctx=ast.Load())],
+            keywords=[],
+        )
+
+
 def js_eval(src: str, variables: dict, In=None) -> Any:
     ns = _base_namespace()
     ns.update(variables)
+    ns["JSArray"] = JSArray
     if In is not None:
         ns["In"] = In
-    code = js_to_py(src)
+    # strip: js_to_py may introduce a leading space (e.g. "!x" -> " not x") and
+    # ast.parse(mode="eval") rejects leading indentation (plain eval tolerated it).
+    code = js_to_py(src).strip()
     try:
-        return eval(code, {"__builtins__": {}}, ns)  # noqa: S307 (restricted)
+        tree = ast.parse(code, mode="eval")
+        tree = _ListToJSArray().visit(tree)
+        ast.fix_missing_locations(tree)
+        return eval(compile(tree, "<js>", "eval"), {"__builtins__": {}}, ns)  # noqa: S307
     except EcmaError:
         raise
     except Exception as exc:  # surfaces as SCXML error.execution in faithful impls

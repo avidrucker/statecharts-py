@@ -28,8 +28,20 @@ binding, `error.execution`/`error.communication` semantics, system variables
 in-process child statecharts with `#_parent`/`#_<invokeid>` event routing,
 `done.invoke.*`, `param`/`namelist`, `autoforward`, and `finalize`.
 
-Deferred (see plan): an **async**/durable event queue, the Fulcro-style
-normalized-store + actors/aliases layer, and **visualization**.
+Higher-level layers:
+
+- **`AsyncSession`** (`aio.py`) — an asyncio runtime that drives a session over
+  real time, waking exactly when the next delayed `<send>` is due.
+- **Normalized store** (`store.py`) — the Fulcro-style app-state pattern: entities
+  by ident, **actors** (named idents), and **aliases** (named attribute paths), with
+  `assoc_alias`/`set_actor` ops and `resolve_actors`/`resolve_aliases` helpers. The
+  path toward porting Fulcro-style statechart-driven apps to Python.
+- **Visualization** (`viz.py`) — `to_mermaid` and `to_dot` renderers.
+
+The scope from the original plan is now complete. The only remaining deferred item
+is a *durable/distributed* event queue (the in-memory queue and the protocol seam to
+swap in a durable one both exist; a concrete Redis/Postgres-backed implementation is
+left as an integration exercise).
 
 ## W3C conformance
 
@@ -42,11 +54,11 @@ A test passes by reaching `<final id="pass">`.
 python3 tests/w3c/runner.py        # full report (add -v for INCOMPLETE/ERROR detail)
 ```
 
-Current result: **150 / 156 runnable tests pass (96%)**, 0 errors. Only 3 tests are
-skipped (`<script>` ecmascript bodies, `<content src>`). The 6 remaining failures are
-narrow feature gaps: inline `function(){...}` IIFEs and JS array prototypes
-(`[].concat`) in the expression evaluator, scxml-as-a-data-value, external `src`
-fetch, and delayed-send cancellation across a terminating child session.
+Current result: **153 / 156 runnable tests pass (98%)**, 0 errors. Only 3 tests are
+skipped (`<script>` ecmascript bodies). The 3 remaining failures are narrow gaps:
+inline `function(){...}` IIFEs in the expression evaluator, using inline SCXML as a
+data *value*, and cancelling a delayed event in another live session (which the spec
+itself notes is undefined).
 
 Driving the suite surfaced (and fixed) several real bugs in the port — most
 notably **document order was numbered post-order instead of pre-order**, which had
@@ -117,6 +129,9 @@ src/statecharts/
   simple.py          # Session facade
   ecma.py            # ECMAScript-subset execution model (for the W3C suite)
   invoke.py          # synchronous <invoke> child-statechart sessions
+  aio.py             # AsyncSession: asyncio runtime (real-time delayed sends)
+  store.py           # normalized store + actors/aliases (Fulcro-style app state)
+  viz.py             # to_mermaid / to_dot chart renderers
   scxml/loader.py    # SCXML XML -> element tree
 tests/
   test_*.py          # native engine tests + W3C smoke guard

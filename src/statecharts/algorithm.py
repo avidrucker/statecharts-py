@@ -663,6 +663,15 @@ def _exec_one(run: _Run, item) -> None:
             parent_q = env.extra.get("_parent_queue")
             if parent_q is None:
                 _raise_error(run, "error.communication")
+            elif delay and delay > 0:
+                # A delayed cross-session send lives on THIS (child) session's queue,
+                # tagged for parent delivery. If the child terminates first it is never
+                # delivered (SCXML: delayed sends die with the sending session).
+                env.event_queue.send(
+                    Event(name, data, origin="#_parent", origintype=_SCXML_PROCESSOR,
+                          sendid=sendid, invokeid=env.extra.get("_invokeid")),
+                    delay=delay, sendid=sendid,
+                )
             else:
                 parent_q.send(
                     Event(name, data, origintype=_SCXML_PROCESSOR, sendid=sendid,
