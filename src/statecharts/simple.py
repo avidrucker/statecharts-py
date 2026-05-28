@@ -16,13 +16,13 @@ from .working_memory import WorkingMemory
 
 
 class Session:
-    def __init__(self, chart, env: Optional[Environment] = None, **env_kwargs):
+    def __init__(self, chart, env: Optional[Environment] = None, data: Optional[dict] = None, **env_kwargs):
         if isinstance(chart, StateNode):
             chart = make_chart(chart)
         if not isinstance(chart, Chart):
             raise TypeError("chart must be a StateNode or Chart")
         self.env = env or make_env(chart, **env_kwargs)
-        self.wm: WorkingMemory = initialize(self.env)
+        self.wm: WorkingMemory = initialize(self.env, data)
 
     @property
     def configuration(self) -> FrozenSet[str]:

@@ -81,7 +81,9 @@ class _Run:
         self._event: Optional[Event] = None
 
     def data_view(self) -> dict:
-        view = dict(self.datamodel)
+        # The DataModel projects the store into the read view seen by expressions
+        # (LocalDataModel returns the store as-is; richer models resolve aliases etc.).
+        view = dict(self.env.data_model.as_data(self.datamodel))
         view["_event"] = self._event.as_data() if self._event else None
         view["_configuration"] = frozenset(self.configuration)
         view["_name"] = self.env.extra.get("_name", "")
@@ -108,14 +110,17 @@ class _Run:
 # ---------------------------------------------------------------------------
 
 
-def initialize(env: Environment) -> WorkingMemory:
+def initialize(env: Environment, initial: Optional[dict] = None) -> WorkingMemory:
     """Build the starting working memory: enter the document's initial states.
 
-    Uses SCXML *early binding* (the default): every ``<data>`` in the document is
-    created and assigned at init, in document order, regardless of whether its
-    owning state is entered."""
+    ``initial`` seeds the data-model store before binding (e.g. a normalized store
+    from :func:`store.initial_store`).  Uses SCXML *early binding* (the default):
+    every ``<data>`` is created and assigned at init, in document order, regardless
+    of whether its owning state is entered."""
     run = _Run(env)
     run.running = True
+    if initial is not None:
+        run.datamodel = dict(initial)
     root = run.chart.root
     late = env.extra.get("_binding", "early") == "late"
     for sid in run.chart.in_document_order(list(run.chart.by_id.keys())):
@@ -539,9 +544,10 @@ def _apply_datamodel(run: _Run, node: StateNode) -> None:
         return
     for loc, expr in node.datamodel.data.items():
         try:
-            run.datamodel[loc] = run.env.execution_model.run(run.env, run.data_view(), expr)
+            val = run.env.execution_model.run(run.env, run.data_view(), expr)
+            run.datamodel = run.env.data_model.transact(run.datamodel, [AssignOp(loc, val)])
         except Exception:  # noqa: BLE001  (illegal <data expr> -> undefined + error.execution)
-            run.datamodel[loc] = None
+            run.datamodel = run.env.data_model.transact(run.datamodel, [AssignOp(loc, None)])
             _raise_error(run)
 
 

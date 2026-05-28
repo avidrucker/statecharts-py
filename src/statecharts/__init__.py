@@ -39,7 +39,11 @@ from .elements import (
 from .environment import Environment, make_env
 from .event_queue import Clock, ManualClock, MemoryEventQueue
 from .events import Event, coerce_event, event_matches
+from . import store
+from .aio import AsyncSession
 from .simple import Session
+from .store import NormalizedDataModel, initial_store, resolve_actors, resolve_aliases
+from .viz import to_dot, to_mermaid
 from .working_memory import WorkingMemory
 
 __version__ = "0.1.0"
@@ -84,5 +88,13 @@ __all__ = [
     "ManualClock",
     "MemoryEventQueue",
     "Session",
+    "AsyncSession",
     "WorkingMemory",
+    "to_mermaid",
+    "to_dot",
+    "store",
+    "NormalizedDataModel",
+    "initial_store",
+    "resolve_actors",
+    "resolve_aliases",
 ]
