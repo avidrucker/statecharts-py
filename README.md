@@ -70,6 +70,10 @@ inline `function(){...}` IIFEs in the expression evaluator, using inline SCXML a
 data *value*, and cancelling a delayed event in another live session (which the spec
 itself notes is undefined).
 
+The missing 2% is conformance of the *embedded scripting language*, not the
+state-machine engine — a deliberate, reversible scope choice. See
+[`why-98-percent-passing.md`](./why-98-percent-passing.md) for the full rationale.
+
 Driving the suite surfaced (and fixed) several real bugs in the port — most
 notably **document order was numbered post-order instead of pre-order**, which had
 silently reversed state entry/exit ordering; `<send>` with no target was routed to
