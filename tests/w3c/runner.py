@@ -110,4 +110,12 @@ def run_all(verbose: bool = False):
 
 
 if __name__ == "__main__":
-    run_all(verbose="-v" in sys.argv)
+    results = run_all(verbose="-v" in sys.argv)
+    # CI guard: `--min N` exits non-zero if fewer than N tests PASS (regression catch).
+    if "--min" in sys.argv:
+        floor = int(sys.argv[sys.argv.index("--min") + 1])
+        npass = sum(1 for r in results if r.status == "PASS")
+        if npass < floor:
+            print(f"\nFAIL: {npass} passing < required {floor}")
+            sys.exit(1)
+        print(f"\nOK: {npass} passing >= required {floor}")

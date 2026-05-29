@@ -1,5 +1,8 @@
 # statecharts (Python)
 
+[![CI](https://github.com/avidrucker/statecharts-py/actions/workflows/ci.yml/badge.svg)](https://github.com/avidrucker/statecharts-py/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 A faithful Python 3 port of [`fulcrologic/statecharts`](https://github.com/fulcrologic/statecharts):
 **W3C SCXML** structure and semantics without the XML, expressed as plain Python data,
 with swappable `DataModel` / `ExecutionModel` / `EventQueue` seams.
@@ -113,7 +116,7 @@ wm = process_event(env, wm, "start")       # -> new WorkingMemory
 ## Run it
 
 ```bash
-python3 run_tests.py               # 43 tests, zero dependencies
+python3 run_tests.py               # 48 tests, zero dependencies
 python3 tests/w3c/runner.py        # W3C conformance report
 ```
 

@@ -235,6 +235,31 @@ class Chart:
         self._resolve_defaults(self.root)
         # re-point root/children at the resolved nodes in by_id
         self.root = self.by_id[self.root.id]
+        # fail fast on dangling references instead of a cryptic KeyError at run time
+        self._validate()
+
+    # -- validation ---------------------------------------------------------
+    def _validate(self) -> None:
+        """Verify every transition/initial/history target resolves to a real state."""
+        for sid, node in self.by_id.items():
+            for t in node.transitions:
+                for tid in t.target:
+                    if tid not in self.by_id:
+                        raise ValueError(
+                            f"transition in state {sid!r} targets unknown state {tid!r}"
+                        )
+            for tid in node.initial:
+                if tid not in self.by_id:
+                    raise ValueError(
+                        f"state {sid!r} has initial target {tid!r} which does not exist"
+                    )
+            if node.history_default is not None:
+                for tid in node.history_default.target:
+                    if tid not in self.by_id:
+                        raise ValueError(
+                            f"history state {sid!r} default transition targets "
+                            f"unknown state {tid!r}"
+                        )
 
     # -- indexing -----------------------------------------------------------
     def _index(self, node: StateNode, parent_id: Optional[str], path: List[str]) -> StateNode:
