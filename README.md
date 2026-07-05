@@ -80,6 +80,42 @@ silently reversed state entry/exit ordering; `<send>` with no target was routed 
 the *internal* queue instead of the *external* one; and the same transition selected
 from two parallel regions executed twice (the "optimally enabled set" must be a set).
 
+## Install
+
+The package has **zero runtime dependencies** and targets **Python ≥ 3.10**.
+
+Install straight from GitHub with pip:
+
+```bash
+# latest on the main branch
+pip install "git+https://github.com/avidrucker/statecharts-py.git"
+
+# pinned to a released version (recommended — reproducible)
+pip install "git+https://github.com/avidrucker/statecharts-py.git@v0.0.1"
+```
+
+To depend on it from another project, add one line to its `pyproject.toml`
+(or `requirements.txt`):
+
+```
+statecharts @ git+https://github.com/avidrucker/statecharts-py.git@v0.0.1
+```
+
+For local development on statecharts itself, install it editable from a clone so
+your edits take effect immediately:
+
+```bash
+git clone https://github.com/avidrucker/statecharts-py.git
+cd statecharts-py
+pip install -e ".[dev]"   # includes pytest
+```
+
+Either way you import it as `statecharts`:
+
+```python
+import statecharts
+```
+
 ## Quick start
 
 ```python
