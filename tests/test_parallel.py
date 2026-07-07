@@ -79,3 +79,54 @@ def test_conflicting_transitions_resolved_by_document_order():
     s.send("e")
     # document order: r1's transition precedes r2's, so r1 wins and r2 is preempted.
     assert s.configuration == frozenset({"out1"}), s.configuration
+
+
+def test_exit_set_clears_all_active_descendants_of_domain():
+    """Exiting a nested compound must remove *every* active descendant of the
+    transition's domain (exercises the active-children descent in _compute_exit_set,
+    #14) while leaving states outside the domain untouched."""
+    chart = statechart({"initial": "app"},
+        state({"id": "app", "initial": "work"},
+            state({"id": "work", "initial": "w_outer"},
+                state({"id": "w_outer", "initial": "w_inner"},
+                    state({"id": "w_inner"}, on("reset", "app")),  # exits `work` subtree
+                ),
+            ),
+            on("bg", "done"),
+        ),
+        state({"id": "done"}),
+    )
+    s = Session(chart)
+    assert s.configuration == frozenset({"app", "work", "w_outer", "w_inner"})
+    s.send("reset")  # domain is `app`; every descendant exits, re-enter app->work->...
+    assert s.configuration == frozenset({"app", "work", "w_outer", "w_inner"})
+    s.send("bg")
+    assert s.configuration == frozenset({"done"})
+
+
+def test_conflicting_transitions_descendant_source_preempts_ancestor():
+    """removeConflictingTransitions removal branch: when a parallel's OWN transition
+    (ancestor source) is selected for a region lacking the event, and another region's
+    atomic has its own transition on that event (descendant source), the descendant
+    transition preempts and REMOVES the already-kept ancestor one.
+
+    Region document order matters: the transition-less region comes first so the
+    ancestor (parallel) transition is kept first, then removed by the later descendant.
+    """
+    chart = statechart({"initial": "B"},
+        parallel({"id": "B"},
+            transition({"event": "e", "target": "OUT"}),        # parallel's own transition
+            state({"id": "r2", "initial": "C"},
+                state({"id": "C"}),                              # no transition on e -> selects B's
+            ),
+            state({"id": "r1", "initial": "A"},
+                state({"id": "A"}, on("e", "INNER")),            # descendant source
+            ),
+        ),
+        state({"id": "INNER"}),
+        state({"id": "OUT"}),
+    )
+    s = Session(chart)
+    s.send("e")
+    # the descendant (A's) transition wins; the ancestor (B's) is removed -> INNER, not OUT
+    assert s.in_state("INNER") and not s.in_state("OUT"), s.configuration
