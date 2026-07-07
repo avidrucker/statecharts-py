@@ -41,9 +41,11 @@ catalogued authoritatively, with the code anchor and the test that pins it, in t
 - **We support `binding="late"`; upstream is early-only** (upstream skips W3C test 280).
 - **We implement `error.communication` and expose `_ioprocessors`; upstream does neither**
   (upstream skips 496 / 325 / 500 / 501).
-- **We support native `<invoke>` including inline `content` (a child statechart value);
-  upstream supports only registry/`src`-based invocation.** So an inline-invoke chart that
-  fails upstream may run here.
+- **We support native `<invoke>` including inline `content` (a **Python child statechart**
+  passed to the builder); upstream supports only registry/`src`-based invocation.** So an
+  inline-invoke chart that fails upstream may run here. (This is distinct from an SCXML
+  *document used as a runtime data value* — W3C `test530` — which this port does **not**
+  support; see [`why-98-percent-passing.md`](../../why-98-percent-passing.md).)
 - **Document order:** both default to depth-first (pre-order). Upstream additionally lets
   you *choose* breadth-first when building a machine (visible only in deeply-nested parallel
   regions); this port implements depth-first only and does **not** expose that knob
