@@ -48,7 +48,7 @@ from .store import NormalizedDataModel, initial_store, resolve_actors, resolve_a
 from .viz import to_dot, to_mermaid
 from .working_memory import WorkingMemory
 
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 
 __all__ = [
     "ops",
