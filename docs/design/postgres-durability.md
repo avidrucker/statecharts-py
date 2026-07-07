@@ -46,13 +46,17 @@ locked/in-flight rows don't bloat the scan.
 → `_deliver`). A crash **between** the delete-commit and the `save_session`-commit loses the
 event: the timer is gone, but its effect (the new working memory) was never written. That is
 **at-most-once with a data-loss window**, not the at-least-once most workflow users expect.
-This already exists on SQLite; a naive Postgres port inherits it.
+This already exists on SQLite (filed as its own bug,
+[#21](https://github.com/avidrucker/statecharts-py/issues/21)); a naive Postgres port
+inherits it.
 
 Two ways to close it:
 
-- **(a) One transaction spanning claim + persist.** Hard/undesirable: `process_event` is
-  engine/app code that may run for a while, and holding a row lock across it limits
-  throughput and couples the queue to processing time.
+- **(a) One transaction spanning claim + persist.** For the multi-worker Postgres case this
+  is undesirable: `process_event` is engine/app code that may run for a while, and holding a
+  row lock across it limits throughput and couples the queue to processing time. **But for
+  the single-process SQLite backend it is likely the *simplest* fix** — wrap claim +
+  `process_event` + `save_session` in one write transaction, no lease machinery needed.
 - **(b) Visibility-timeout (lease) column — recommended.** Don't delete on claim; set
   `status='in_flight', claimed_at=now` under `FOR UPDATE SKIP LOCKED`. On successful
   `save_session`, delete the row. A worker that crashes leaves an in-flight row whose lease
