@@ -78,12 +78,10 @@ def test_deep_history_inside_parallel_region_crossing():
     assert s.configuration == frozenset({"paused"})
 
     s.send("resume")  # re-enter targeting region a's deep history
-    # region a is restored to its historical *deep* atomic
-    assert s.in_state("a1y")
-    # region b was NOT covered by history -> back to its default, not b2
-    assert s.in_state("b1") and not s.in_state("b2")
-    # both regions of the parallel are active again
-    assert s.in_state("a") and s.in_state("b") and s.in_state("p")
+    # Pin the FULL configuration: region a restored to its historical deep atomic
+    # (a1y, not a1x), region b back to its default (b1, not b2, since history covered
+    # only region a), both regions + the parallel active, and no stale states.
+    assert s.configuration == frozenset({"p", "a", "a1", "a1y", "b", "b1"})
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +106,7 @@ def test_error_execution_precedes_done_state_event():
     )
     s = Session(chart)
     s.send("complete")
+    assert s.in_state("fin")  # the completion actually happened
     assert "error.execution" in order and "done.state.outer" in order
     assert order.index("error.execution") < order.index("done.state.outer"), order
 
@@ -132,10 +131,15 @@ def test_system_variable_write_raises_and_aborts_block():
         handle("error.execution", _recorder(log, "error.execution")),
     )
     s = Session(chart)
+    # The observable contract: the illegal write raises error.execution and, under
+    # strict-by-default block semantics, aborts the rest of the block. (We do NOT
+    # assert `_sessionid` "stays uncorrupted": it lives in env.extra and the read
+    # view hard-overrides it from there — a datamodel write could never surface, so
+    # such an assertion could never fail. Both assertions below CAN fail: swap the
+    # bad assign for a legal declared one and error.execution vanishes / the sibling
+    # runs.)
     assert "error.execution" in log
     assert "after-bad-assign" not in log, log
-    # the system variable was not corrupted
-    assert s.data.get("_sessionid") in (None, "")
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +185,7 @@ def test_error_communication_is_async_and_non_aborting():
         handle("error.communication", _recorder(log, "error.communication")),
     )
     s = Session(chart)
+    assert s.configuration == frozenset({"a"})  # entry completed, machine settled in a
     assert "sibling-ran" in log, log            # block was NOT aborted
     assert "error.communication" in log, log    # error still delivered
     # ordering: the sibling runs during the block; the error is delivered afterward
