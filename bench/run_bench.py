@@ -7,8 +7,10 @@ stress different parts of the algorithm:
 * **wide**  — one ``parallel`` with N ping/pong regions; every event fires one
   transition *per region*, stressing the optimal-enabled-set computation across
   parallel regions.
-* **deep**  — N nested compound states with two toggling leaves at the bottom;
-  every event exits/enters near the leaf but computes the LCCA up a deep tree.
+* **deep**  — N nested compound states with two toggling leaves at the bottom.
+  The toggle's LCCA is shallow (the leaves' immediate parent), so this does NOT
+  stress deep-LCCA; it measures per-event cost as the *active configuration grows*,
+  since the exit-set computation scans the whole configuration (``algorithm.py:379``).
 * **loop**  — a 2-state ping/pong chart; isolates pure per-event overhead (the
   ``WorkingMemory`` frozenset rebuild at ``algorithm.py:99``).
 
@@ -64,7 +66,7 @@ def wide_chart(regions: int):
 def deep_chart(depth: int):
     """`depth` nested compound states with two toggling leaves at the bottom."""
     node = state({"id": "leaf", "initial": "leaf0"},
-        state({"id": "leaf0"}, on("go", "leaf1")),
+        state({"id": "leaf0"}, on("go", "leaf1")),  # sibling toggle: LCCA is `leaf`
         state({"id": "leaf1"}, on("go", "leaf0")),
     )
     for i in range(depth):
@@ -86,9 +88,22 @@ def loop_chart():
 
 
 def drive(root, events: int, alloc: bool):
-    """Send `events` ``go`` events through the functional core; return (secs, peak_kb)."""
+    """Send `events` ``go`` events through the functional core; return (secs, peak_kb).
+
+    Self-check: a single warm-up event MUST change the configuration. Without this,
+    a regressed builder (bad id, an event that stops matching) would make
+    ``process_event`` a no-op and the harness would report a huge, meaningless
+    events/sec — silently invalidating the whole benchmark (and the O(N^2) finding).
+    The warm-up also removes first-call/import noise from the timed loop.
+    """
     env = make_env(make_chart(root))
     wm = initialize(env)
+    before = wm.configuration
+    wm = process_event(env, wm, "go")  # warm-up + work-happened self-check
+    if wm.configuration == before:
+        raise AssertionError(
+            "benchmark chart did not transition on 'go' — measuring nothing"
+        )
     if alloc:
         tracemalloc.start()
     t0 = time.perf_counter()
@@ -123,8 +138,11 @@ def shapes(quick: bool):
     ]
 
 
-def run_scale(alloc: bool):
-    """Sweep wide-chart region count to expose the parallel-handling cliff."""
+def run_scale():
+    """Sweep wide-chart region count to expose the parallel-handling cliff.
+
+    Timing-only (no `--alloc` column): allocation is measured per-shape by the main
+    table, and adding tracemalloc here would distort the scaling comparison."""
     print("wide-parallel scaling (500 events per point):")
     print(f"  {'N regions':>10}{'secs':>10}{'events/sec':>14}{'us/event':>12}")
     prev = None
@@ -145,7 +163,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.scale:
-        run_scale(args.alloc)
+        run_scale()
         return 0
 
     header = f"{'shape':<22}{'events':>10}{'secs':>10}{'events/sec':>14}"

@@ -156,7 +156,7 @@ wm = process_event(env, wm, "start")       # -> new WorkingMemory
 ## Run it
 
 ```bash
-python3 run_tests.py               # 48 tests, zero dependencies
+python3 run_tests.py               # full test suite, zero dependencies
 python3 tests/w3c/runner.py        # W3C conformance report
 python3 bench/run_bench.py         # throughput benchmark (add --quick / --scale) — see bench/README.md
 ```

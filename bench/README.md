@@ -22,7 +22,7 @@ zero-dependency stance (cf. `run_tests.py`).
 | Shape | What it stresses |
 |---|---|
 | **wide** | one `parallel` with N ping/pong regions — every event fires one transition **per region**, stressing the optimal-enabled-set / LCCA work across parallel regions |
-| **deep** | N nested compound states with two toggling leaves — LCCA computed up a deep tree |
+| **deep** | N nested compound states with two toggling leaves — the toggle's LCCA is shallow, so this measures per-event cost as the *active configuration grows* (the exit-set scan is O(configuration size)), **not** deep-LCCA |
 | **loop** | a 2-state ping/pong chart — pure per-event overhead (the `WorkingMemory` frozenset rebuild) |
 
 > `wide` events each fire N transitions, so its raw events/sec is **not** comparable to
