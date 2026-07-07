@@ -296,24 +296,36 @@ def _select_eventless_transitions(run: _Run) -> List[ET]:
 
 
 def _remove_conflicting_transitions(run: _Run, enabled: List[ET]) -> List[ET]:
-    filtered: List[ET] = []
     c = run.chart
-    for t1 in enabled:
+    # Compute each transition's exit set ONCE, up front. The W3C
+    # removeConflictingTransitions computes exit1/exit2 once per transition; the
+    # previous code recomputed exit2 for every already-kept transition on every
+    # outer iteration (O(n^2) exit-set computations, each an O(configuration) scan),
+    # which made parallel-heavy charts blow up super-linearly (issue #8). Caching
+    # collapses the inner check to a set intersection over precomputed sets.
+    exit_sets = [_compute_exit_set(run, [t]) for t in enabled]
+    # `filtered` holds indices into `enabled` (kept in document order). We track
+    # indices rather than the ET values so removal targets the *specific* kept
+    # transition; the old code did `t not in to_remove` (value equality), which
+    # would remove every value-equal ET at once. That only differs if two enabled
+    # transitions are value-equal, which the enabled-set dedup invariant forbids —
+    # so this is behaviour-preserving, and slightly sharper.
+    filtered: List[int] = []
+    for i1, t1 in enumerate(enabled):
         preempted = False
-        to_remove: List[ET] = []
-        ex1 = _compute_exit_set(run, [t1])
-        for t2 in filtered:
-            ex2 = _compute_exit_set(run, [t2])
-            if ex1 & ex2:
-                if c.is_descendant(t1.source, t2.source):
-                    to_remove.append(t2)
+        to_remove: List[int] = []
+        ex1 = exit_sets[i1]
+        for i2 in filtered:
+            if ex1 & exit_sets[i2]:
+                if c.is_descendant(t1.source, enabled[i2].source):
+                    to_remove.append(i2)
                 else:
                     preempted = True
                     break
         if not preempted:
-            filtered = [t for t in filtered if t not in to_remove]
-            filtered.append(t1)
-    return filtered
+            filtered = [i for i in filtered if i not in to_remove]
+            filtered.append(i1)
+    return [enabled[i] for i in filtered]
 
 
 # ---------------------------------------------------------------------------
