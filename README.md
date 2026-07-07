@@ -10,6 +10,10 @@ with swappable `DataModel` / `ExecutionModel` / `EventQueue` seams.
 👉 **New here? Start with the runnable demos in [`examples/`](./examples/)** — they're
 numbered in a recommended order, from the core engine to the advanced layers.
 
+👉 **Coming from the Clojure library?** See
+[Porting from `fulcrologic/statecharts`](./docs/guide/porting-from-clojure.md) — the naming
+map, the four seams, and the deliberate behavioral divergences.
+
 See [`init_plan.md`](./init_plan.md) for the full feasibility analysis and roadmap that motivated this port.
 
 ## Status

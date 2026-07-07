@@ -22,8 +22,8 @@ For the separate question of the 3 non-green W3C tests (embedded-scripting scope
 
 - **Rows 1–5 make us diverge from upstream by being *stricter* or *more complete*.** A
   developer porting a chart from `fulcrologic/statecharts` should read
-  `docs/guide/porting-from-clojure.md` (forthcoming — issue #5), which will link back here
-  for the authoritative list.
+  [`docs/guide/porting-from-clojure.md`](../guide/porting-from-clojure.md), which links back
+  here for the authoritative list.
 - **Row 1 vs Row 2 interact:** because block-abort is strict by default (row 1), the illegal
   system-variable write in row 2 also prevents the *rest of that entry/exit block* from
   running. The `error.communication` path (row 3) is the deliberate exception — it does
