@@ -330,7 +330,10 @@ def _remove_conflicting_transitions(run: _Run, enabled: List[ET]) -> List[ET]:
     # the set of kept enabled-indices whose exit set contains `s`. A new transition
     # can only conflict with kept ones that share at least one exit state, so we
     # gather exactly those candidates from the index. For disjoint parallel regions
-    # (whose exit sets don't overlap) there are none, so the whole check is O(1).
+    # (whose exit sets don't overlap) there are none, so the whole check is O(1) —
+    # that is the near-linear case this targets. A pathological chart where every
+    # transition's exit set overlaps (e.g. one deep chain) still degrades toward
+    # O(n^2 log n), but that is not the parallel-fan-out shape #8 was about.
     #
     # `filtered`/`kept` hold enabled-indices, always ascending == document order
     # (we iterate i1 upward and only ever append or delete), so `sorted(candidates)`
