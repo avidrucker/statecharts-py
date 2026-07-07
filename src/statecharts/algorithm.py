@@ -303,8 +303,14 @@ def _remove_conflicting_transitions(run: _Run, enabled: List[ET]) -> List[ET]:
     # outer iteration (O(n^2) exit-set computations, each an O(configuration) scan),
     # which made parallel-heavy charts blow up super-linearly (issue #8). Caching
     # collapses the inner check to a set intersection over precomputed sets.
-    exit_sets = {i: _compute_exit_set(run, [t]) for i, t in enumerate(enabled)}
-    filtered: List[int] = []  # indices into `enabled`, in document order
+    exit_sets = [_compute_exit_set(run, [t]) for t in enabled]
+    # `filtered` holds indices into `enabled` (kept in document order). We track
+    # indices rather than the ET values so removal targets the *specific* kept
+    # transition; the old code did `t not in to_remove` (value equality), which
+    # would remove every value-equal ET at once. That only differs if two enabled
+    # transitions are value-equal, which the enabled-set dedup invariant forbids —
+    # so this is behaviour-preserving, and slightly sharper.
+    filtered: List[int] = []
     for i1, t1 in enumerate(enabled):
         preempted = False
         to_remove: List[int] = []
