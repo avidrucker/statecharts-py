@@ -209,5 +209,6 @@ def test_ioprocessors_system_variable_populated():
     Session(chart)
     io = seen["io"]
     assert isinstance(io, dict)
-    assert "http://www.w3.org/TR/scxml/#SCXMLEventProcessor" in io
-    assert "location" in io["http://www.w3.org/TR/scxml/#SCXMLEventProcessor"]
+    entry = io["http://www.w3.org/TR/scxml/#SCXMLEventProcessor"]
+    # location tracks the session id (default session id is "")
+    assert entry["location"] == ""
