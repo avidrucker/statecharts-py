@@ -303,29 +303,67 @@ def _remove_conflicting_transitions(run: _Run, enabled: List[ET]) -> List[ET]:
     # outer iteration (O(n^2) exit-set computations, each an O(configuration) scan),
     # which made parallel-heavy charts blow up super-linearly (issue #8). Caching
     # collapses the inner check to a set intersection over precomputed sets.
-    exit_sets = [_compute_exit_set(run, [t]) for t in enabled]
-    # `filtered` holds indices into `enabled` (kept in document order). We track
-    # indices rather than the ET values so removal targets the *specific* kept
-    # transition; the old code did `t not in to_remove` (value equality), which
-    # would remove every value-equal ET at once. That only differs if two enabled
-    # transitions are value-equal, which the enabled-set dedup invariant forbids —
-    # so this is behaviour-preserving, and slightly sharper.
-    filtered: List[int] = []
+    # Each transition's exit set is the active states strictly below its domain.
+    # Computing it via a full-configuration scan per transition is O(n * configuration)
+    # — the residual quadratic term after the exit-set caching in the first #8 pass.
+    # Build the active-children index once and descend from each domain instead, so
+    # the precompute drops to ~O(n) for disjoint parallel regions (small exit sets).
+    active_children = _active_children_index(run)
+
+    def _exit_of(et: ET) -> Set[str]:
+        # Mirror _compute_exit_set([et]) exactly: no target, or a None domain (no
+        # resolvable target states), means an empty exit set. (Guarding None matters:
+        # active_children[None] is the root, so descending from None would wrongly
+        # return the whole configuration.)
+        if not et.transition.target:
+            return set()
+        domain = _transition_domain(run, et)
+        if domain is None:
+            return set()
+        return _active_descendants(domain, active_children)
+
+    exit_sets = [_exit_of(t) for t in enabled]
+
+    # Two transitions conflict iff their exit sets intersect. Rather than compare
+    # every kept transition pairwise (O(n^2), the bulk of the parallel-region cliff
+    # in #8), index the kept transitions by the states they exit: `by_state[s]` is
+    # the set of kept enabled-indices whose exit set contains `s`. A new transition
+    # can only conflict with kept ones that share at least one exit state, so we
+    # gather exactly those candidates from the index. For disjoint parallel regions
+    # (whose exit sets don't overlap) there are none, so the whole check is O(1).
+    #
+    # `filtered`/`kept` hold enabled-indices, always ascending == document order
+    # (we iterate i1 upward and only ever append or delete), so `sorted(candidates)`
+    # replays the original doc-order scan — preserving the exact preempt/removal
+    # semantics (descendant source is removed; first non-descendant preempts).
+    kept: set = set()
+    by_state: dict = {}
     for i1, t1 in enumerate(enabled):
+        ex1 = exit_sets[i1]
+        candidates: set = set()
+        for s in ex1:
+            bucket = by_state.get(s)
+            if bucket:
+                candidates |= bucket  # shares an exit state -> exit sets intersect
         preempted = False
         to_remove: List[int] = []
-        ex1 = exit_sets[i1]
-        for i2 in filtered:
-            if ex1 & exit_sets[i2]:
-                if c.is_descendant(t1.source, enabled[i2].source):
-                    to_remove.append(i2)
-                else:
-                    preempted = True
-                    break
+        for i2 in sorted(candidates):  # ascending == document order
+            if c.is_descendant(t1.source, enabled[i2].source):
+                to_remove.append(i2)
+            else:
+                preempted = True
+                break
         if not preempted:
-            filtered = [i for i in filtered if i not in to_remove]
-            filtered.append(i1)
-    return [enabled[i] for i in filtered]
+            for i2 in to_remove:
+                kept.discard(i2)
+                for s in exit_sets[i2]:
+                    b = by_state.get(s)
+                    if b:
+                        b.discard(i2)
+            kept.add(i1)
+            for s in ex1:
+                by_state.setdefault(s, set()).add(i1)
+    return [enabled[i] for i in sorted(kept)]
 
 
 # ---------------------------------------------------------------------------
@@ -388,17 +426,41 @@ def _transition_domain(run: _Run, et: ET) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def _active_children_index(run: _Run) -> Dict[str, List[str]]:
+    """parent id -> its active child ids. The configuration is ancestor-closed, so
+    this lets us find a domain's active descendants by descending instead of scanning
+    the whole configuration for each transition (see :func:`_active_descendants`)."""
+    index: Dict[str, List[str]] = {}
+    parent = run.chart.parent
+    for s in run.configuration:
+        index.setdefault(parent[s], []).append(s)
+    return index
+
+
+def _active_descendants(domain: str, active_children: Dict[str, List[str]]) -> Set[str]:
+    """The active states strictly below ``domain`` — i.e. exactly
+    ``{s in configuration if is_descendant(s, domain)}``, computed by descent."""
+    out: Set[str] = set()
+    stack = list(active_children.get(domain, ()))
+    while stack:
+        sid = stack.pop()
+        out.add(sid)
+        stack.extend(active_children.get(sid, ()))
+    return out
+
+
 def _compute_exit_set(run: _Run, transitions: Iterable[ET]) -> Set[str]:
-    c = run.chart
+    # Union of each transition's exit set (active states below its domain). Descending
+    # via the active-children index is O(exit-set size) per transition instead of an
+    # O(configuration) scan, which matters when many transitions fire at once (one per
+    # region in a wide parallel chart) — see #8/#14.
+    active_children = _active_children_index(run)
     to_exit: Set[str] = set()
     for et in transitions:
         if et.transition.target:
             domain = _transition_domain(run, et)
-            if domain is None:
-                continue
-            for s in run.configuration:
-                if c.is_descendant(s, domain):
-                    to_exit.add(s)
+            if domain is not None:
+                to_exit |= _active_descendants(domain, active_children)
     return to_exit
 
 
