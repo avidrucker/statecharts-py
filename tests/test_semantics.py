@@ -190,3 +190,24 @@ def test_error_communication_is_async_and_non_aborting():
     assert "error.communication" in log, log    # error still delivered
     # ordering: the sibling runs during the block; the error is delivered afterward
     assert log.index("sibling-ran") < log.index("error.communication"), log
+
+
+# ---------------------------------------------------------------------------
+# Gap 6 — the _ioprocessors system variable is populated (upstream doesn't expose it)
+# ---------------------------------------------------------------------------
+
+
+def test_ioprocessors_system_variable_populated():
+    """`_ioprocessors` is exposed in the data view with the SCXML event-processor
+    entry (upstream `fulcrologic/statecharts` does not expose it at all)."""
+    seen = {}
+    chart = statechart({"initial": "a"},
+        state({"id": "a"},
+            on_entry(Script(lambda env, data: (seen.update(io=data.get("_ioprocessors")), [])[1])),
+        ),
+    )
+    Session(chart)
+    io = seen["io"]
+    assert isinstance(io, dict)
+    assert "http://www.w3.org/TR/scxml/#SCXMLEventProcessor" in io
+    assert "location" in io["http://www.w3.org/TR/scxml/#SCXMLEventProcessor"]

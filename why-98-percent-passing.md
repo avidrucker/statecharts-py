@@ -5,6 +5,9 @@ tests. This doc explains the 6 non-green tests — what they are, why each is le
 alone, and why the remaining 2% is a deliberate, reversible scope decision rather
 than a bug or an oversight.
 
+> For the *green* corners where we deliberately diverge from the spec/upstream (often by
+> being stricter), see the [behavior register](./docs/reference/behavior-register.md).
+
 > **The one-sentence version:** 98% is the conformance of the *state-machine engine*;
 > the missing 2% is conformance of the *embedded scripting language* — a different,
 > much larger thing we intentionally didn't build, with a cheap escape hatch if it's
