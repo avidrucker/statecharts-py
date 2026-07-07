@@ -74,6 +74,11 @@ The missing 2% is conformance of the *embedded scripting language*, not the
 state-machine engine — a deliberate, reversible scope choice. See
 [`why-98-percent-passing.md`](./why-98-percent-passing.md) for the full rationale.
 
+Where the engine makes a **deliberate choice** at a corner of SCXML semantics — several
+of which make this port *stricter* or more complete than upstream
+`fulcrologic/statecharts` — those decisions are catalogued, with rationale and the test
+that pins each, in the [behavior register](./docs/reference/behavior-register.md).
+
 Driving the suite surfaced (and fixed) several real bugs in the port — most
 notably **document order was numbered post-order instead of pre-order**, which had
 silently reversed state entry/exit ordering; `<send>` with no target was routed to
