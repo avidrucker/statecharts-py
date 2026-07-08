@@ -137,3 +137,35 @@ def test_durable_crash_between_claim_and_persist_does_not_lose_event():
     rt.tick()
     assert "waiting" in rt.load("s1").configuration, rt.load("s1").configuration
     store.close()
+
+
+def test_durable_one_failing_event_does_not_revert_a_co_due_sibling():
+    """Per-event atomicity (bug #21 review): when two independent sessions have events
+    due in the same tick and one delivery fails, the other session's delivery must still
+    commit — sessions are isolated, one poison event can't roll back its batch-mates."""
+    chart = statechart({"initial": "a"}, state({"id": "a"}, on("go", "b")), state({"id": "b"}))
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", chart)
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "good")
+    rt.start("c", "poison")
+    rt.enqueue("good", "go")     # enqueued first -> claimed/delivered first
+    rt.enqueue("poison", "go")
+
+    real = rt._deliver
+    def deliver(session_id, event):
+        if session_id == "poison":
+            raise RuntimeError("simulated delivery failure")
+        return real(session_id, event)
+    rt._deliver = deliver
+
+    try:
+        rt.tick()
+    except RuntimeError:
+        pass  # poison fails loud
+
+    # the innocent session committed its progress; it was NOT rolled back with the poison
+    assert "b" in rt.load("good").configuration, rt.load("good").configuration
+    # the poison event is preserved (not lost), for retry / operator attention
+    assert store.next_due() is not None
+    store.close()

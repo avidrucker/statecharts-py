@@ -15,13 +15,15 @@ The schema/queries port directly to Postgres for true multi-node distribution
 (replace :meth:`SqliteStore.claim_due`'s transaction with
 ``SELECT ... FOR UPDATE SKIP LOCKED``).
 
-Delivery contract: each :meth:`DurableRuntime.tick` batch — claiming due timers,
-persisting the resulting working memory, and any cascade ``<send>`` it enqueues — runs
-inside a single :meth:`SqliteStore.atomic` transaction. A crash mid-batch rolls the whole
-thing back, so timers are redelivered on the next tick and each event takes effect
-**exactly once** (no lost or double-applied events; bug #21). The multi-worker Postgres
-port instead uses a lease/visibility-timeout for **at-least-once** delivery (which then
-requires idempotent handlers) — see ``docs/design/postgres-durability.md``.
+Delivery contract: :meth:`DurableRuntime.tick` delivers **one event per transaction** —
+claiming a due timer, persisting the resulting working memory, and any cascade ``<send>``
+it enqueues all run inside a single :meth:`SqliteStore.atomic` transaction. A crash/error
+during delivery rolls that event back (so it is redelivered on the next tick and takes
+effect **exactly once** — no lost or double-applied events; bug #21), while events already
+delivered in the same tick keep their committed progress (independent sessions are
+isolated — one failing event never reverts another's). The multi-worker Postgres port
+instead uses a lease/visibility-timeout for **at-least-once** delivery (which then requires
+idempotent handlers) — see ``docs/design/postgres-durability.md``.
 
 Limitation: active child ``<invoke>`` sessions are not persisted (they live only in
 an in-process run); durable sessions are for the persist-between-external-events use
@@ -168,14 +170,17 @@ class SqliteStore:
         try:
             yield
         except BaseException:
-            self._depth -= 1
-            if self._depth == 0:
+            if outer:
                 self.conn.rollback()
             raise
         else:
-            self._depth -= 1
-            if self._depth == 0:
+            if outer:
                 self.conn.commit()
+        finally:
+            # Always restore depth, even if commit/rollback raised; `outer` (captured at
+            # entry) — not a re-read of _depth — decides who commits, so the count can't
+            # drift on nested or failing blocks.
+            self._depth -= 1
 
     def _commit(self) -> None:
         """Commit now, unless we're inside an ``atomic()`` block (then defer to it)."""
@@ -224,7 +229,9 @@ class SqliteStore:
     def claim_due(self, now: float) -> List[Tuple[str, Event]]:
         """Atomically take all timers due at/<= ``now`` (oldest first) and return
         ``(session_id, event)`` pairs. The single write transaction is what makes this
-        safe for multiple processes on one machine."""
+        safe for multiple processes on one machine. Delivery (:meth:`DurableRuntime.tick`)
+        uses :meth:`claim_one_due` instead, so one failing event can't roll back its
+        co-due batch-mates."""
         with self.atomic():
             rows = self.conn.execute(
                 "SELECT id, session_id, event FROM timers WHERE due<=? ORDER BY due, id",
@@ -235,6 +242,21 @@ class SqliteStore:
                     "DELETE FROM timers WHERE id=?", [(r["id"],) for r in rows]
                 )
         return [(r["session_id"], event_from_jsonable(json.loads(r["event"]))) for r in rows]
+
+    def claim_one_due(self, now: float) -> Optional[Tuple[str, Event]]:
+        """Atomically claim (delete) the **single** oldest due timer, or ``None`` if
+        nothing is due. Delivering one event per transaction keeps sessions isolated: a
+        crash/error reverts and retries only that event, never its co-due batch-mates
+        (bug #21 follow-up — per-event, not per-batch, atomicity)."""
+        with self.atomic():
+            row = self.conn.execute(
+                "SELECT id, session_id, event FROM timers WHERE due<=? ORDER BY due, id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if row is None:
+                return None
+            self.conn.execute("DELETE FROM timers WHERE id=?", (row["id"],))
+            return (row["session_id"], event_from_jsonable(json.loads(row["event"])))
 
 
 # ---------------------------------------------------------------------------
@@ -323,16 +345,18 @@ class DurableRuntime:
         delivered = 0
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now
-            # One transaction per batch: claiming the timers, persisting the resulting
-            # working memory, and any cascade <send> they enqueue all commit together.
-            # If delivery crashes mid-batch, everything rolls back and the timers are
-            # redelivered on the next tick — no event is lost (bug #21).
+            # One transaction PER EVENT: claiming the timer, persisting the resulting
+            # working memory, and any cascade <send> it enqueues all commit together, or
+            # roll back together on a crash/error — so the event is never lost (bug #21)
+            # and, crucially, one failing event can't revert a co-due event from another
+            # session (they each commit independently).
             with self.store.atomic():
-                due = self.store.claim_due(t)
-                for session_id, event in due:
+                claimed = self.store.claim_one_due(t)
+                if claimed is not None:
+                    session_id, event = claimed
                     self._deliver(session_id, event)
                     delivered += 1
-            if not due:
+            if claimed is None:
                 break
         return delivered
 

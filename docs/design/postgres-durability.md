@@ -47,10 +47,11 @@ locked/in-flight rows don't bloat the scan.
 event: the timer is gone, but its effect (the new working memory) was never written. That is
 **at-most-once with a data-loss window**, not the at-least-once most workflow users expect.
 This existed on SQLite (bug [#21](https://github.com/avidrucker/statecharts-py/issues/21))
-and is now **fixed there** by option (a) below — each `tick` batch (claim + persist +
-cascade enqueues) runs in one `SqliteStore.atomic()` transaction, giving **exactly-once**
-delivery on a single node. The Postgres port still needs a different answer because
-option (a) doesn't scale to multiple workers (see below).
+and is now **fixed there** by option (a) below — each event is delivered in its own
+`SqliteStore.atomic()` transaction (claim one + persist + cascade enqueues), giving
+**exactly-once** delivery on a single node without coupling co-due events. The Postgres
+port still needs a different answer because option (a) doesn't scale to multiple workers
+(see below).
 
 Two ways to close it:
 
