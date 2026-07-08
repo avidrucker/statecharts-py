@@ -15,6 +15,14 @@ The schema/queries port directly to Postgres for true multi-node distribution
 (replace :meth:`SqliteStore.claim_due`'s transaction with
 ``SELECT ... FOR UPDATE SKIP LOCKED``).
 
+Delivery contract: each :meth:`DurableRuntime.tick` batch — claiming due timers,
+persisting the resulting working memory, and any cascade ``<send>`` it enqueues — runs
+inside a single :meth:`SqliteStore.atomic` transaction. A crash mid-batch rolls the whole
+thing back, so timers are redelivered on the next tick and each event takes effect
+**exactly once** (no lost or double-applied events; bug #21). The multi-worker Postgres
+port instead uses a lease/visibility-timeout for **at-least-once** delivery (which then
+requires idempotent handlers) — see ``docs/design/postgres-durability.md``.
+
 Limitation: active child ``<invoke>`` sessions are not persisted (they live only in
 an in-process run); durable sessions are for the persist-between-external-events use
 case, where data is JSON-serializable.
@@ -23,6 +31,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -139,9 +148,39 @@ class SqliteStore:
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
         self.clock = clock or Clock()
+        self._depth = 0  # >0 while inside atomic(): per-call commits are deferred
 
     def close(self) -> None:
         self.conn.close()
+
+    @contextmanager
+    def atomic(self):
+        """A write transaction that batches the otherwise per-call commits of
+        ``save_session`` / ``enqueue`` / ``cancel`` / ``claim_due`` into one unit, so a
+        crash mid-batch rolls the whole thing back. This is what makes delivery atomic:
+        claiming a timer, persisting the resulting working memory, and any cascade
+        ``<send>`` it enqueues all commit together, or not at all (bug #21). Nesting is
+        depth-counted — only the outermost block begins and commits/rolls back."""
+        outer = self._depth == 0
+        if outer:
+            self.conn.execute("BEGIN IMMEDIATE")
+        self._depth += 1
+        try:
+            yield
+        except BaseException:
+            self._depth -= 1
+            if self._depth == 0:
+                self.conn.rollback()
+            raise
+        else:
+            self._depth -= 1
+            if self._depth == 0:
+                self.conn.commit()
+
+    def _commit(self) -> None:
+        """Commit now, unless we're inside an ``atomic()`` block (then defer to it)."""
+        if self._depth == 0:
+            self.conn.commit()
 
     # -- sessions -----------------------------------------------------------
     def save_session(self, session_id: str, chart: str, wm: WorkingMemory) -> None:
@@ -151,7 +190,7 @@ class SqliteStore:
             "wm=excluded.wm, updated=excluded.updated",
             (session_id, chart, json.dumps(wm_to_jsonable(wm)), self.clock.now()),
         )
-        self.conn.commit()
+        self._commit()
 
     def load_session(self, session_id: str) -> Optional[SessionRecord]:
         row = self.conn.execute(
@@ -170,13 +209,13 @@ class SqliteStore:
             "INSERT INTO timers(session_id, due, event, sendid) VALUES(?,?,?,?)",
             (session_id, due, json.dumps(event_to_jsonable(event)), sendid),
         )
-        self.conn.commit()
+        self._commit()
 
     def cancel(self, session_id: str, sendid: str) -> None:
         self.conn.execute(
             "DELETE FROM timers WHERE session_id=? AND sendid=?", (session_id, sendid)
         )
-        self.conn.commit()
+        self._commit()
 
     def next_due(self) -> Optional[float]:
         row = self.conn.execute("SELECT MIN(due) AS d FROM timers").fetchone()
@@ -186,8 +225,7 @@ class SqliteStore:
         """Atomically take all timers due at/<= ``now`` (oldest first) and return
         ``(session_id, event)`` pairs. The single write transaction is what makes this
         safe for multiple processes on one machine."""
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self.atomic():
             rows = self.conn.execute(
                 "SELECT id, session_id, event FROM timers WHERE due<=? ORDER BY due, id",
                 (now,),
@@ -196,10 +234,6 @@ class SqliteStore:
                 self.conn.executemany(
                     "DELETE FROM timers WHERE id=?", [(r["id"],) for r in rows]
                 )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
         return [(r["session_id"], event_from_jsonable(json.loads(r["event"]))) for r in rows]
 
 
@@ -289,12 +323,17 @@ class DurableRuntime:
         delivered = 0
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now
-            due = self.store.claim_due(t)
+            # One transaction per batch: claiming the timers, persisting the resulting
+            # working memory, and any cascade <send> they enqueue all commit together.
+            # If delivery crashes mid-batch, everything rolls back and the timers are
+            # redelivered on the next tick — no event is lost (bug #21).
+            with self.store.atomic():
+                due = self.store.claim_due(t)
+                for session_id, event in due:
+                    self._deliver(session_id, event)
+                    delivered += 1
             if not due:
                 break
-            for session_id, event in due:
-                self._deliver(session_id, event)
-                delivered += 1
         return delivered
 
     def next_due(self) -> Optional[float]:

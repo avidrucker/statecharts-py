@@ -101,3 +101,39 @@ def test_durable_datamodel_persists():
     finally:
         if os.path.exists(path):
             os.remove(path)
+
+
+def test_durable_crash_between_claim_and_persist_does_not_lose_event():
+    """Bug #21: if the process dies after a timer is claimed but before the resulting
+    working memory is persisted, the event must NOT be lost — claim + persist must be
+    atomic, so a crash rolls both back and the event is redelivered on the next tick."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("flow", flow_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("flow", "s1")
+    rt.enqueue("s1", "begin")  # due now
+
+    # Simulate a crash: persisting the new working memory raises the first time,
+    # i.e. after the timer has been claimed but before its effect is committed.
+    real_save = store.save_session
+    calls = {"n": 0}
+    def flaky_save(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated crash before WM persisted")
+        return real_save(*a, **k)
+    store.save_session = flaky_save
+    try:
+        rt.tick()
+    except RuntimeError:
+        pass  # the "crash"
+
+    # Atomic rollback: the claim (delete) AND the partial WM write were both undone.
+    assert "idle" in rt.load("s1").configuration     # WM did not advance
+    assert store.next_due() is not None              # the "begin" timer survived
+
+    # And the event is delivered exactly once on a clean retry (not lost, not doubled).
+    store.save_session = real_save
+    rt.tick()
+    assert "waiting" in rt.load("s1").configuration, rt.load("s1").configuration
+    store.close()
