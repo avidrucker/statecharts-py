@@ -25,6 +25,12 @@ isolated — one failing event never reverts another's). The multi-worker Postgr
 instead uses a lease/visibility-timeout for **at-least-once** delivery (which then requires
 idempotent handlers) — see ``docs/design/postgres-durability.md``.
 
+Poison events: a delivery that *errors* (as opposed to a crash) increments the timer's
+attempt count and is skipped for the rest of that tick, so it can't head-of-line-block
+newer events. After ``DurableRuntime.DEAD_LETTER_CAP`` (default 5) failed attempts the
+event is moved to the ``dead_letters`` table — never silently dropped — and a warning is
+logged. Inspect parked events with :meth:`SqliteStore.dead_letters`.
+
 Limitation: active child ``<invoke>`` sessions are not persisted (they live only in
 an in-process run); durable sessions are for the persist-between-external-events use
 case, where data is JSON-serializable.
@@ -32,10 +38,13 @@ case, where data is JSON-serializable.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from .algorithm import initialize, process_event
 from .chart import Chart, make_chart
@@ -127,10 +136,20 @@ CREATE TABLE IF NOT EXISTS timers (
     session_id TEXT NOT NULL,
     due        REAL NOT NULL,
     event      TEXT NOT NULL,
-    sendid     TEXT
+    sendid     TEXT,
+    attempts   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS timers_due ON timers(due);
 CREATE INDEX IF NOT EXISTS timers_session ON timers(session_id);
+CREATE TABLE IF NOT EXISTS dead_letters (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    due        REAL NOT NULL,
+    event      TEXT NOT NULL,
+    attempts   INTEGER NOT NULL,
+    last_error TEXT,
+    dead_at    REAL NOT NULL
+);
 """
 
 
@@ -148,9 +167,15 @@ class SqliteStore:
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL")  # durability + concurrent readers
         self.conn.executescript(_SCHEMA)
+        # Migrate a pre-existing timers table that lacks the `attempts` column
+        # (CREATE TABLE IF NOT EXISTS won't add a column to an existing table).
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(timers)")}
+        if "attempts" not in cols:
+            self.conn.execute("ALTER TABLE timers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
         self.conn.commit()
         self.clock = clock or Clock()
         self._depth = 0  # >0 while inside atomic(): per-call commits are deferred
+        self._sp = 0     # savepoint nesting counter (unique names)
 
     def close(self) -> None:
         self.conn.close()
@@ -186,6 +211,26 @@ class SqliteStore:
         """Commit now, unless we're inside an ``atomic()`` block (then defer to it)."""
         if self._depth == 0:
             self.conn.commit()
+
+    @contextmanager
+    def savepoint(self):
+        """A nested rollback point *inside* an ``atomic()`` block. On error it undoes only
+        this block's writes (not the whole transaction), so the caller can then commit
+        compensating changes. Used to discard a failed delivery's working-memory write
+        while still recording the attempt / dead-lettering it (#24)."""
+        name = f"sp{self._sp}"
+        self._sp += 1
+        self.conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            self.conn.execute(f"ROLLBACK TO {name}")
+            self.conn.execute(f"RELEASE {name}")
+            raise
+        else:
+            self.conn.execute(f"RELEASE {name}")
+        finally:
+            self._sp -= 1
 
     # -- sessions -----------------------------------------------------------
     def save_session(self, session_id: str, chart: str, wm: WorkingMemory) -> None:
@@ -229,9 +274,10 @@ class SqliteStore:
     def claim_due(self, now: float) -> List[Tuple[str, Event]]:
         """Atomically take all timers due at/<= ``now`` (oldest first) and return
         ``(session_id, event)`` pairs. The single write transaction is what makes this
-        safe for multiple processes on one machine. Delivery (:meth:`DurableRuntime.tick`)
-        uses :meth:`claim_one_due` instead, so one failing event can't roll back its
-        co-due batch-mates."""
+        safe for multiple processes on one machine. A batch primitive kept for the store
+        interface (and the Postgres port, #19); delivery (:meth:`DurableRuntime.tick`)
+        instead peeks one event at a time (:meth:`peek_one_due`) so a failing event can be
+        retried / dead-lettered without disturbing its co-due neighbours."""
         with self.atomic():
             rows = self.conn.execute(
                 "SELECT id, session_id, event FROM timers WHERE due<=? ORDER BY due, id",
@@ -243,20 +289,58 @@ class SqliteStore:
                 )
         return [(r["session_id"], event_from_jsonable(json.loads(r["event"]))) for r in rows]
 
-    def claim_one_due(self, now: float) -> Optional[Tuple[str, Event]]:
-        """Atomically claim (delete) the **single** oldest due timer, or ``None`` if
-        nothing is due. Delivering one event per transaction keeps sessions isolated: a
-        crash/error reverts and retries only that event, never its co-due batch-mates
-        (bug #21 follow-up — per-event, not per-batch, atomicity)."""
-        with self.atomic():
-            row = self.conn.execute(
-                "SELECT id, session_id, event FROM timers WHERE due<=? ORDER BY due, id LIMIT 1",
-                (now,),
+    def peek_one_due(self, now: float, exclude: Tuple[int, ...] = ()) -> Optional[sqlite3.Row]:
+        """The single oldest due timer whose id is not in ``exclude``, **without** deleting
+        it. Returns a row (``id, session_id, due, event, attempts``) or ``None``. Delivery
+        (:meth:`DurableRuntime.tick`) peeks, delivers, and deletes on success in one
+        transaction — so a failed delivery can be recorded (attempt bump / dead-letter)
+        instead of silently vanishing, and skipped for the rest of the tick via ``exclude``."""
+        exclude = tuple(exclude)
+        cols = "id, session_id, due, event, attempts"
+        if exclude:
+            placeholders = ",".join("?" * len(exclude))
+            return self.conn.execute(
+                f"SELECT {cols} FROM timers WHERE due<=? AND id NOT IN ({placeholders}) "
+                "ORDER BY due, id LIMIT 1",
+                (now, *exclude),
             ).fetchone()
-            if row is None:
-                return None
-            self.conn.execute("DELETE FROM timers WHERE id=?", (row["id"],))
-            return (row["session_id"], event_from_jsonable(json.loads(row["event"])))
+        return self.conn.execute(
+            f"SELECT {cols} FROM timers WHERE due<=? ORDER BY due, id LIMIT 1", (now,)
+        ).fetchone()
+
+    def delete_timer(self, timer_id: int) -> None:
+        self.conn.execute("DELETE FROM timers WHERE id=?", (timer_id,))
+        self._commit()
+
+    def bump_attempts(self, timer_id: int) -> None:
+        self.conn.execute("UPDATE timers SET attempts=attempts+1 WHERE id=?", (timer_id,))
+        self._commit()
+
+    def dead_letter(self, timer_id: int, error: str) -> None:
+        """Move a repeatedly-failing timer out of the live queue into ``dead_letters``,
+        recording the final attempt count and the error (#24)."""
+        row = self.conn.execute(
+            "SELECT session_id, due, event, attempts FROM timers WHERE id=?", (timer_id,)
+        ).fetchone()
+        if row is None:
+            return
+        self.conn.execute(
+            "INSERT INTO dead_letters(session_id, due, event, attempts, last_error, dead_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (row["session_id"], row["due"], row["event"], row["attempts"] + 1,
+             error, self.clock.now()),
+        )
+        self.conn.execute("DELETE FROM timers WHERE id=?", (timer_id,))
+        self._commit()
+
+    def dead_letters(self) -> List[sqlite3.Row]:
+        """Events parked after exceeding the delivery-attempt cap — the queryable signal
+        that something needs attention (rows: session_id, due, event, attempts,
+        last_error, dead_at)."""
+        return self.conn.execute(
+            "SELECT session_id, due, event, attempts, last_error, dead_at "
+            "FROM dead_letters ORDER BY id"
+        ).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +378,9 @@ class SqliteEventQueue:
 class DurableRuntime:
     """Ties the store + registry together: start sessions, enqueue external events,
     and deliver due events (persisting working memory after each step)."""
+
+    #: Delivery attempts before an event is dead-lettered (#23 ruling). Tunable.
+    DEAD_LETTER_CAP = 5
 
     def __init__(self, store: SqliteStore, registry: ChartRegistry, *,
                  data_model=None, execution_model=None, extra: Optional[dict] = None):
@@ -343,21 +430,38 @@ class DurableRuntime:
         cascades (a delivered event may enqueue more due-now events). Returns the
         number of events delivered."""
         delivered = 0
+        tried: set = set()  # timer ids that failed-under-cap this tick -> skip for the rest
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now
-            # One transaction PER EVENT: claiming the timer, persisting the resulting
-            # working memory, and any cascade <send> it enqueues all commit together, or
-            # roll back together on a crash/error — so the event is never lost (bug #21)
-            # and, crucially, one failing event can't revert a co-due event from another
-            # session (they each commit independently).
+            # One transaction PER EVENT: peek the oldest due timer, deliver + persist +
+            # cascade-enqueues + delete-on-success all commit together (or roll back on a
+            # crash — the event is never lost, bug #21). A delivery *error* is caught: a
+            # SAVEPOINT discards the failed working-memory write, then we record the attempt
+            # (or dead-letter past the cap) and commit that. A failed-under-cap event is
+            # excluded (`tried`) for the rest of this tick so it can't re-block newer events
+            # (#24) — it retries on a later tick.
             with self.store.atomic():
-                claimed = self.store.claim_one_due(t)
-                if claimed is not None:
-                    session_id, event = claimed
-                    self._deliver(session_id, event)
+                row = self.store.peek_one_due(t, exclude=tuple(tried))
+                if row is None:
+                    break
+                timer_id = row["id"]
+                session_id = row["session_id"]
+                event = event_from_jsonable(json.loads(row["event"]))
+                try:
+                    with self.store.savepoint():
+                        self._deliver(session_id, event)
+                        self.store.delete_timer(timer_id)
                     delivered += 1
-            if claimed is None:
-                break
+                except Exception as exc:  # noqa: BLE001 — delivery error, not a crash
+                    if row["attempts"] + 1 >= self.DEAD_LETTER_CAP:
+                        self.store.dead_letter(timer_id, str(exc))
+                        logger.warning(
+                            "durable: dead-lettered event for session %r after %d attempts: %s",
+                            session_id, row["attempts"] + 1, exc,
+                        )
+                    else:
+                        self.store.bump_attempts(timer_id)
+                        tried.add(timer_id)
         return delivered
 
     def next_due(self) -> Optional[float]:

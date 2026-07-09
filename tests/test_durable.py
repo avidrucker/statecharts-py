@@ -169,3 +169,52 @@ def test_durable_one_failing_event_does_not_revert_a_co_due_sibling():
     # the poison event is preserved (not lost), for retry / operator attention
     assert store.next_due() is not None
     store.close()
+
+
+def _poison_chart():
+    return statechart({"initial": "a"}, state({"id": "a"}, on("go", "b")), state({"id": "b"}))
+
+
+def test_durable_poison_oldest_does_not_block_newer_event():
+    """#24: a permanently-failing OLDEST event must not block a newer event queued behind
+    it — the queue skips past the failing one and delivers the newer session's event."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "poison")
+    rt.start("c", "good")
+    rt.enqueue("poison", "go")   # enqueued first -> OLDEST due
+    rt.enqueue("good", "go")
+
+    real = rt._deliver
+    def deliver(session_id, event):
+        if session_id == "poison":
+            raise RuntimeError("poison")
+        return real(session_id, event)
+    rt._deliver = deliver
+
+    rt.tick()  # must NOT wedge on the oldest (poison) event
+    assert "b" in rt.load("good").configuration, rt.load("good").configuration
+    store.close()
+
+
+def test_durable_event_dead_lettered_after_cap():
+    """#24: an event that fails to deliver 5x is moved to a dead_letters table (with its
+    error), removed from timers, and no longer blocks the queue."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
+
+    for _ in range(5):
+        rt.tick()  # attempt 1..5; the 5th moves it to dead_letters
+
+    assert store.next_due() is None, "timer should be gone from the live queue"
+    dl = store.dead_letters()
+    assert len(dl) == 1
+    assert dl[0]["session_id"] == "s1"
+    assert "always fails" in dl[0]["last_error"]
+    assert dl[0]["attempts"] == 5
+    store.close()
