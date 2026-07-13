@@ -25,11 +25,24 @@ isolated — one failing event never reverts another's). The multi-worker Postgr
 instead uses a lease/visibility-timeout for **at-least-once** delivery (which then requires
 idempotent handlers) — see ``docs/design/postgres-durability.md``.
 
-Poison events: a delivery that *errors* (as opposed to a crash) increments the timer's
-attempt count and is skipped for the rest of that tick, so it can't head-of-line-block
-newer events. After ``DurableRuntime.DEAD_LETTER_CAP`` (default 5) failed attempts the
-event is moved to the ``dead_letters`` table — never silently dropped — and a warning is
-logged. Inspect parked events with :meth:`SqliteStore.dead_letters`.
+Poison events: delivery failures are classified by exception type.
+
+* An ``Exception`` is treated as *poison*: the timer's attempt count is incremented and its
+  ``due`` is pushed into the future (exponential **backoff**), so a briefly-unavailable
+  dependency gets a real spaced retry window and the failing event can't head-of-line-block
+  newer events. A warning is logged on *every* attempt. After
+  ``DurableRuntime.DEAD_LETTER_CAP`` (default 5) failed attempts the event is moved to the
+  ``dead_letters`` table — never silently dropped. An event whose stored payload can't be
+  decoded at all is unrecoverable and is dead-lettered immediately.
+* A ``BaseException`` (``SystemExit``/``KeyboardInterrupt``) is treated as a *crash*: it
+  propagates out of :meth:`DurableRuntime.tick`, the :meth:`SqliteStore.atomic` block rolls
+  back, and **no** attempt is burned — so the event is redelivered and applied exactly once
+  (bug #21), never mistaken for poison.
+
+Note a deliberate consequence: a *healthy* event that keeps failing for a non-payload reason
+(e.g. a datamodel value that is never JSON-serializable) is parked after the cap by design —
+preserved in ``dead_letters`` with a loud warning, not lost. Inspect parked events with
+:meth:`SqliteStore.dead_letters`.
 
 Limitation: active child ``<invoke>`` sessions are not persisted (they live only in
 an in-process run); durable sessions are for the persist-between-external-events use
@@ -289,48 +302,44 @@ class SqliteStore:
                 )
         return [(r["session_id"], event_from_jsonable(json.loads(r["event"]))) for r in rows]
 
-    def peek_one_due(self, now: float, exclude: Tuple[int, ...] = ()) -> Optional[sqlite3.Row]:
-        """The single oldest due timer whose id is not in ``exclude``, **without** deleting
-        it. Returns a row (``id, session_id, due, event, attempts``) or ``None``. Delivery
+    def peek_one_due(self, now: float) -> Optional[sqlite3.Row]:
+        """The single oldest due timer (``due <= now``), **without** deleting it. Returns a
+        row (``id, session_id, due, event, attempts``) or ``None``. Delivery
         (:meth:`DurableRuntime.tick`) peeks, delivers, and deletes on success in one
-        transaction — so a failed delivery can be recorded (attempt bump / dead-letter)
-        instead of silently vanishing, and skipped for the rest of the tick via ``exclude``."""
-        exclude = tuple(exclude)
-        cols = "id, session_id, due, event, attempts"
-        if exclude:
-            placeholders = ",".join("?" * len(exclude))
-            return self.conn.execute(
-                f"SELECT {cols} FROM timers WHERE due<=? AND id NOT IN ({placeholders}) "
-                "ORDER BY due, id LIMIT 1",
-                (now, *exclude),
-            ).fetchone()
+        transaction — so a failed delivery can be recorded (backoff / dead-letter) instead of
+        silently vanishing. A failed event is rescheduled into the future (:meth:`defer`), so
+        it is no longer ``due`` this tick and can't be re-peeked — no exclusion set needed."""
         return self.conn.execute(
-            f"SELECT {cols} FROM timers WHERE due<=? ORDER BY due, id LIMIT 1", (now,)
+            "SELECT id, session_id, due, event, attempts FROM timers "
+            "WHERE due<=? ORDER BY due, id LIMIT 1",
+            (now,),
         ).fetchone()
 
     def delete_timer(self, timer_id: int) -> None:
         self.conn.execute("DELETE FROM timers WHERE id=?", (timer_id,))
         self._commit()
 
-    def bump_attempts(self, timer_id: int) -> None:
-        self.conn.execute("UPDATE timers SET attempts=attempts+1 WHERE id=?", (timer_id,))
+    def defer(self, timer_id: int, new_due: float) -> None:
+        """Record a failed delivery attempt and reschedule the timer to ``new_due`` (backoff),
+        atomically. Because the event is no longer due until ``new_due`` it can't head-of-line
+        -block newer events, and it gets a real spaced retry window (#24, SCP-C-001)."""
+        self.conn.execute(
+            "UPDATE timers SET attempts=attempts+1, due=? WHERE id=?", (new_due, timer_id)
+        )
         self._commit()
 
-    def dead_letter(self, timer_id: int, error: str) -> None:
-        """Move a repeatedly-failing timer out of the live queue into ``dead_letters``,
-        recording the final attempt count and the error (#24)."""
-        row = self.conn.execute(
-            "SELECT session_id, due, event, attempts FROM timers WHERE id=?", (timer_id,)
-        ).fetchone()
-        if row is None:
-            return
+    def dead_letter(self, row: sqlite3.Row, error: str) -> None:
+        """Move a repeatedly-failing (or undecodable) timer out of the live queue into
+        ``dead_letters``, recording the final attempt count and the error (#24). ``row`` is
+        the timer row the caller already peeked, so there is no redundant re-SELECT
+        (SCP-C-009)."""
         self.conn.execute(
             "INSERT INTO dead_letters(session_id, due, event, attempts, last_error, dead_at) "
             "VALUES(?,?,?,?,?,?)",
             (row["session_id"], row["due"], row["event"], row["attempts"] + 1,
              error, self.clock.now()),
         )
-        self.conn.execute("DELETE FROM timers WHERE id=?", (timer_id,))
+        self.conn.execute("DELETE FROM timers WHERE id=?", (row["id"],))
         self._commit()
 
     def dead_letters(self) -> List[sqlite3.Row]:
@@ -381,6 +390,10 @@ class DurableRuntime:
 
     #: Delivery attempts before an event is dead-lettered (#23 ruling). Tunable.
     DEAD_LETTER_CAP = 5
+    #: Exponential-backoff base (seconds) for a failed delivery: attempt ``n`` reschedules
+    #: to ``now + BACKOFF_BASE_S * 2**(n-1)``, capped at ``BACKOFF_MAX_S``.
+    BACKOFF_BASE_S = 1.0
+    BACKOFF_MAX_S = 3600.0
 
     def __init__(self, store: SqliteStore, registry: ChartRegistry, *,
                  data_model=None, execution_model=None, extra: Optional[dict] = None):
@@ -430,38 +443,56 @@ class DurableRuntime:
         cascades (a delivered event may enqueue more due-now events). Returns the
         number of events delivered."""
         delivered = 0
-        tried: set = set()  # timer ids that failed-under-cap this tick -> skip for the rest
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now
             # One transaction PER EVENT: peek the oldest due timer, deliver + persist +
             # cascade-enqueues + delete-on-success all commit together (or roll back on a
-            # crash — the event is never lost, bug #21). A delivery *error* is caught: a
-            # SAVEPOINT discards the failed working-memory write, then we record the attempt
-            # (or dead-letter past the cap) and commit that. A failed-under-cap event is
-            # excluded (`tried`) for the rest of this tick so it can't re-block newer events
-            # (#24) — it retries on a later tick.
+            # crash — the event is never lost, bug #21). A delivery *error* (Exception) is
+            # caught below; a *crash* (BaseException) propagates and rolls back untouched.
             with self.store.atomic():
-                row = self.store.peek_one_due(t, exclude=tuple(tried))
+                row = self.store.peek_one_due(t)
                 if row is None:
                     break
                 timer_id = row["id"]
                 session_id = row["session_id"]
-                event = event_from_jsonable(json.loads(row["event"]))
+
+                # Decode first, inside the handled path: an undecodable payload can never
+                # succeed, so it is dead-lettered immediately rather than wedging the queue
+                # or being pointlessly retried (SCP-C-002).
+                try:
+                    event = event_from_jsonable(json.loads(row["event"]))
+                except Exception as exc:  # noqa: BLE001 — corrupt/undecodable payload
+                    self.store.dead_letter(row, f"undecodable event: {exc!r}")
+                    logger.warning(
+                        "durable: dead-lettered undecodable event for session %r (id=%s): %s",
+                        session_id, timer_id, exc,
+                    )
+                    continue
+
                 try:
                     with self.store.savepoint():
                         self._deliver(session_id, event)
                         self.store.delete_timer(timer_id)
                     delivered += 1
                 except Exception as exc:  # noqa: BLE001 — delivery error, not a crash
-                    if row["attempts"] + 1 >= self.DEAD_LETTER_CAP:
-                        self.store.dead_letter(timer_id, str(exc))
+                    # A crash (BaseException) is intentionally NOT caught: it propagates,
+                    # atomic() rolls back, and no attempt is burned (bug #21). Only a normal
+                    # Exception is poison: back off, then dead-letter past the cap (#24).
+                    n = row["attempts"] + 1
+                    if n >= self.DEAD_LETTER_CAP:
+                        self.store.dead_letter(row, str(exc))
                         logger.warning(
                             "durable: dead-lettered event for session %r after %d attempts: %s",
-                            session_id, row["attempts"] + 1, exc,
+                            session_id, n, exc,
                         )
                     else:
-                        self.store.bump_attempts(timer_id)
-                        tried.add(timer_id)
+                        backoff = min(self.BACKOFF_BASE_S * (2 ** (n - 1)), self.BACKOFF_MAX_S)
+                        self.store.defer(timer_id, t + backoff)
+                        logger.warning(
+                            "durable: delivery failed for session %r (attempt %d/%d); "
+                            "retrying after %.3gs backoff: %s",
+                            session_id, n, self.DEAD_LETTER_CAP, backoff, exc,
+                        )
         return delivered
 
     def next_due(self) -> Optional[float]:

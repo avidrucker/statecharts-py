@@ -1,4 +1,6 @@
 """Durable SQLite-backed event queue + session store."""
+import json
+import logging
 import os
 import tempfile
 
@@ -106,31 +108,36 @@ def test_durable_datamodel_persists():
 def test_durable_crash_between_claim_and_persist_does_not_lose_event():
     """Bug #21: if the process dies after a timer is claimed but before the resulting
     working memory is persisted, the event must NOT be lost — claim + persist must be
-    atomic, so a crash rolls both back and the event is redelivered on the next tick."""
+    atomic, so a crash rolls both back and the event is redelivered on the next tick.
+    A crash is modelled with a BaseException (SCP-Q-001): it propagates, rolls back, and —
+    unlike a poison delivery Exception — burns no attempt (exactly-once, not retry-toward-cap)."""
     store = SqliteStore(":memory:", clock=ManualClock())
     reg = ChartRegistry().register("flow", flow_chart())
     rt = DurableRuntime(store, reg)
     rt.start("flow", "s1")
     rt.enqueue("s1", "begin")  # due now
 
-    # Simulate a crash: persisting the new working memory raises the first time,
-    # i.e. after the timer has been claimed but before its effect is committed.
+    # Simulate a crash: persisting the new working memory dies the first time (a BaseException,
+    # i.e. a genuine interrupt/crash — not an application-level delivery error), after the
+    # timer has been claimed but before its effect is committed.
     real_save = store.save_session
     calls = {"n": 0}
     def flaky_save(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise RuntimeError("simulated crash before WM persisted")
+            raise KeyboardInterrupt("simulated crash before WM persisted")
         return real_save(*a, **k)
     store.save_session = flaky_save
     try:
         rt.tick()
-    except RuntimeError:
-        pass  # the "crash"
+    except KeyboardInterrupt:
+        pass  # the "crash" propagated out of tick()
 
     # Atomic rollback: the claim (delete) AND the partial WM write were both undone.
     assert "idle" in rt.load("s1").configuration     # WM did not advance
     assert store.next_due() is not None              # the "begin" timer survived
+    surviving = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
+    assert surviving["attempts"] == 0                 # a crash burns no attempt (not poison)
 
     # And the event is delivered exactly once on a clean retry (not lost, not doubled).
     store.save_session = real_save
@@ -159,13 +166,14 @@ def test_durable_one_failing_event_does_not_revert_a_co_due_sibling():
         return real(session_id, event)
     rt._deliver = deliver
 
-    try:
-        rt.tick()
-    except RuntimeError:
-        pass  # poison fails loud
+    # A delivery error is caught per-event (not propagated), so one poison event can't
+    # abort the tick — tick() returns normally (SCP-C-008: assert this directly rather than
+    # via a now-unreachable `except RuntimeError`).
+    delivered = rt.tick()
 
     # the innocent session committed its progress; it was NOT rolled back with the poison
     assert "b" in rt.load("good").configuration, rt.load("good").configuration
+    assert delivered == 1, "exactly the healthy sibling was delivered"
     # the poison event is preserved (not lost), for retry / operator attention
     assert store.next_due() is not None
     store.close()
@@ -200,7 +208,9 @@ def test_durable_poison_oldest_does_not_block_newer_event():
 
 def test_durable_event_dead_lettered_after_cap():
     """#24: an event that fails to deliver 5x is moved to a dead_letters table (with its
-    error), removed from timers, and no longer blocks the queue."""
+    error), removed from timers, and no longer blocks the queue. With retry backoff
+    (SCP-C-001) each attempt only becomes due after time passes, so the drain advances the
+    clock between attempts rather than burning all five back-to-back."""
     store = SqliteStore(":memory:", clock=ManualClock())
     reg = ChartRegistry().register("c", _poison_chart())
     rt = DurableRuntime(store, reg)
@@ -209,6 +219,7 @@ def test_durable_event_dead_lettered_after_cap():
     rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
 
     for _ in range(5):
+        store.clock.advance(10_000.0)  # clear any backoff so the timer is due again
         rt.tick()  # attempt 1..5; the 5th moves it to dead_letters
 
     assert store.next_due() is None, "timer should be gone from the live queue"
@@ -217,4 +228,111 @@ def test_durable_event_dead_lettered_after_cap():
     assert dl[0]["session_id"] == "s1"
     assert "always fails" in dl[0]["last_error"]
     assert dl[0]["attempts"] == 5
+    store.close()
+
+
+def test_durable_failed_delivery_is_backed_off_to_the_future():
+    """SCP-C-001: a failed delivery must be rescheduled into the future (a real retry
+    window), not left immediately re-eligible. Without backoff a fixed-clock drain burns
+    every attempt back-to-back in microseconds; with backoff one tick records exactly one
+    attempt and the timer's next due time moves past `now`."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down for now"))
+
+    t0 = store.clock.now()
+    rt.tick()  # one failed attempt at t0
+
+    # The event is backed off: still live, but its next due time is in the future.
+    assert store.next_due() is not None, "event must not be lost"
+    assert store.next_due() > t0, "failed delivery must be rescheduled into the future"
+
+    # A fixed-clock drain does NOT keep burning attempts — nothing is due yet.
+    rt.tick(); rt.tick(); rt.tick()
+    row = store.conn.execute("SELECT attempts FROM timers").fetchone()
+    assert row is not None and row["attempts"] == 1, "no back-to-back attempt burn at fixed clock"
+    assert store.dead_letters() == [], "one transient failure must not dead-letter"
+    store.close()
+
+
+def test_durable_corrupt_row_is_dead_lettered_not_wedged():
+    """SCP-C-002: an un-decodable oldest timer row (corrupt/legacy event JSON) must be
+    dead-lettered, not re-peeked-and-re-raised forever. A healthy newer event queued behind
+    it must still be delivered in the same tick."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    # Corrupt row goes in first -> it is the OLDEST due timer (lowest id, same due).
+    store.conn.execute(
+        "INSERT INTO timers(session_id, due, event, sendid) VALUES(?,?,?,?)",
+        ("ghost", 0.0, "{ this is not valid json", None),
+    )
+    store.conn.commit()
+    rt.start("c", "good")
+    rt.enqueue("good", "go")  # healthy event, queued behind the corrupt row
+
+    rt.tick()  # must NOT raise out of tick()
+
+    assert "b" in rt.load("good").configuration, "healthy event delivered past the corrupt row"
+    dl = store.dead_letters()
+    assert len(dl) == 1 and dl[0]["session_id"] == "ghost", "corrupt row parked, not wedged"
+    assert store.next_due() is None, "queue drained; nothing left blocking"
+    store.close()
+
+
+def test_durable_under_cap_failure_is_logged():
+    """SCP-C-007: every failed delivery attempt — not only the terminal dead-letter — must
+    emit a warning, so an intermittent fault that recovers before the cap is still visible
+    to operators."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("transient blip"))
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("statecharts.durable")
+    logger.addHandler(handler)
+    try:
+        rt.tick()  # a single under-cap (attempt 1 of 5) failure
+    finally:
+        logger.removeHandler(handler)
+
+    warnings = [r for r in records if r.levelno >= logging.WARNING]
+    assert warnings, "an under-cap failed attempt must be logged"
+    assert "s1" in warnings[0].getMessage(), "the log names the affected session"
+    store.close()
+
+
+def test_durable_baseexception_propagates_without_burning_an_attempt():
+    """SCP-C-004 / SCP-Q-001: a BaseException (e.g. KeyboardInterrupt / SystemExit) during
+    delivery is a *crash*, not a poison payload. It must propagate out of tick(), roll the
+    transaction back, and burn NO attempt — preserving bug #21's exactly-once contract."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+
+    def crash(sid, ev):
+        raise KeyboardInterrupt("operator hit Ctrl-C mid-delivery")
+    rt._deliver = crash
+
+    raised = False
+    try:
+        rt.tick()
+    except KeyboardInterrupt:
+        raised = True
+    assert raised, "a BaseException must propagate out of tick() (crash, not poison)"
+
+    row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
+    assert row is not None, "the event survived the crash (atomic rollback)"
+    assert row["attempts"] == 0, "a crash must not burn a delivery attempt"
+    assert store.dead_letters() == [], "a crash must never dead-letter"
     store.close()
