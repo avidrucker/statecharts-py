@@ -165,21 +165,24 @@ class ChartRegistry:
 # ---------------------------------------------------------------------------
 
 
-class StoreError(BaseException):
+class StoreError(Exception):
     """A durable-store persistence failure — the store's *own* DB operation failed (disk full,
     database locked, I/O error). :class:`SqliteStore` raises this (wrapping the underlying
     ``sqlite3.Error``) so :meth:`DurableRuntime.tick` can classify by *authority*: a
-    ``StoreError`` is infrastructure (propagate, roll back, retry indefinitely — never counted
-    toward the poison cap), whereas any *other* exception during delivery is the event's own
-    fault (poison). A handler that raises a bare ``sqlite3.Error`` from its own DB resource is
-    therefore poison, not infra — because it did not come through this store (SCP-C-019/030).
+    ``StoreError`` is infrastructure (roll back, retry indefinitely — never counted toward the
+    poison cap), whereas any *other* exception during delivery is the event's own fault (poison).
+    A handler that raises a bare ``sqlite3.Error`` from its own DB resource is therefore poison,
+    not infra — because it did not come through this store (SCP-C-019).
 
-    It subclasses ``BaseException`` **deliberately**: an infra failure must not be swallowed by
-    an application-level ``except Exception`` — including the engine's executable-content error
-    handling. That way a store failure during a cascade ``<send>`` inside ``process_event``
-    still unwinds to :meth:`tick`, which rolls the whole delivery back atomically (so the
-    cascade commits with the event or not at all — bug #21 / SCP-C-030) instead of being turned
-    into an ``error.execution`` and committing a half-delivered step."""
+    It is an ordinary ``Exception`` so an idiomatic ``except Exception`` caller — a poller that
+    also calls :meth:`DurableRuntime.enqueue` / :meth:`~DurableRuntime.start` — catches a
+    transient outage instead of crashing (SCP-C-038). One consequence: a store failure during a
+    cascade ``<send>`` *inside* ``process_event`` is caught by the engine's executable-content
+    handling and becomes an ``error.execution`` (the send is not scheduled), rather than rolling
+    the whole delivery back — the same executable-content error semantics as any other bad
+    content (SCP-C-035). Store failures on the ``tick`` path itself (load / save / delete /
+    the transaction boundary) are *not* inside ``process_event`` and so are still classified as
+    infrastructure and retried."""
 
 
 class UnknownSessionError(Exception):
@@ -270,6 +273,22 @@ class SqliteStore:
         except sqlite3.Error as exc:
             raise StoreError(str(exc)) from exc
 
+    def _query_one(self, sql: str, params: tuple = ()):
+        """Execute + ``fetchone`` inside one :class:`StoreError` guard, so an error raised while
+        *stepping* the row (not just at ``execute``) is still wrapped (SCP-C-040)."""
+        try:
+            return self.conn.execute(sql, params).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreError(str(exc)) from exc
+
+    def _query_all(self, sql: str, params: tuple = ()):
+        """Execute + ``fetchall`` inside one :class:`StoreError` guard, so an error raised while
+        stepping to a *later* row of a multi-row read is wrapped, not leaked raw (SCP-C-040)."""
+        try:
+            return self.conn.execute(sql, params).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreError(str(exc)) from exc
+
     def _txn(self, fn) -> None:
         """Run a transaction-control call (``conn.commit`` / ``conn.rollback``), translating a
         ``sqlite3.Error`` into :class:`StoreError` so a failure at a transaction *boundary* is
@@ -278,6 +297,15 @@ class SqliteStore:
             fn()
         except sqlite3.Error as exc:
             raise StoreError(str(exc)) from exc
+
+    def _rollback_quietly(self) -> None:
+        """Best-effort rollback used while already unwinding an error: it clears an aborted
+        transaction (so the *next* ``BEGIN`` can start) without masking the original exception
+        if the rollback itself fails (SCP-C-037)."""
+        try:
+            self.conn.rollback()
+        except sqlite3.Error:
+            pass
 
     @contextmanager
     def atomic(self):
@@ -298,11 +326,19 @@ class SqliteStore:
             yield
         except BaseException:
             if outer:
-                self._txn(self.conn.rollback)
+                # Best-effort rollback that never masks the exception we're unwinding.
+                self._rollback_quietly()
             raise
         else:
             if outer:
-                self._txn(self.conn.commit)
+                try:
+                    self.conn.commit()
+                except sqlite3.Error as exc:
+                    # A COMMIT failure leaves the transaction OPEN — roll it back so the next
+                    # BEGIN can start, then surface it as infrastructure. Without this the
+                    # connection stays mid-transaction and every later tick wedges (SCP-C-037).
+                    self._rollback_quietly()
+                    raise StoreError(str(exc)) from exc
         finally:
             # Always restore depth, even if commit/rollback raised; `outer` (captured at
             # entry) — not a re-read of _depth — decides who commits, so the count can't
@@ -352,17 +388,17 @@ class SqliteStore:
         self._commit()
 
     def load_session(self, session_id: str) -> Optional[SessionRecord]:
-        # The SELECT goes through _exec (a read failure is StoreError = infra); decoding the
+        # The SELECT goes through _query_one (a read failure is StoreError = infra); decoding the
         # blob is separate, so a corrupt/undecodable wm raises json/KeyError = poison (SCP-C-028).
-        row = self._exec(
+        row = self._query_one(
             "SELECT chart, wm FROM sessions WHERE session_id=?", (session_id,)
-        ).fetchone()
+        )
         if row is None:
             return None
         return SessionRecord(session_id, row["chart"], wm_from_jsonable(json.loads(row["wm"])))
 
     def session_ids(self) -> List[str]:
-        return [r["session_id"] for r in self._exec("SELECT session_id FROM sessions")]
+        return [r["session_id"] for r in self._query_all("SELECT session_id FROM sessions")]
 
     # -- timers (the durable mailbox) --------------------------------------
     def enqueue(self, session_id: str, event: Event, due: float, sendid: Optional[str] = None) -> None:
@@ -379,7 +415,7 @@ class SqliteStore:
         self._commit()
 
     def next_due(self) -> Optional[float]:
-        row = self._exec("SELECT MIN(due) AS d FROM timers").fetchone()
+        row = self._query_one("SELECT MIN(due) AS d FROM timers")
         return row["d"] if row and row["d"] is not None else None
 
     def peek_one_due(self, now: float) -> Optional[sqlite3.Row]:
@@ -389,11 +425,11 @@ class SqliteStore:
         transaction — so a failed delivery can be recorded (backoff / dead-letter) instead of
         silently vanishing. A failed event is rescheduled into the future (:meth:`defer`), so
         it is no longer ``due`` this tick and can't be re-peeked — no exclusion set needed."""
-        return self._exec(
+        return self._query_one(
             "SELECT id, session_id, due, event, attempts FROM timers "
             "WHERE due<=? ORDER BY due, id LIMIT 1",
             (now,),
-        ).fetchone()
+        )
 
     def delete_timer(self, timer_id: int) -> None:
         self._exec("DELETE FROM timers WHERE id=?", (timer_id,))
@@ -431,10 +467,10 @@ class SqliteStore:
         """Events parked after exceeding the delivery-attempt cap — the queryable signal
         that something needs attention (rows: session_id, due, event, attempts,
         last_error, dead_at)."""
-        return self._exec(
+        return self._query_all(
             "SELECT session_id, due, event, attempts, last_error, dead_at "
             "FROM dead_letters ORDER BY id"
-        ).fetchall()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -543,20 +579,21 @@ class DurableRuntime:
         Delivery failures are classified by AUTHORITY, not by exception type (a handler can
         raise the same types the store does):
 
-        * :class:`StoreError` — our DB failed to read/write, *anywhere* (a transaction boundary,
-          a persist, or a cascade ``<send>``) — is infrastructure: the event is rolled back and
-          left queued (no attempt burned), this ``tick`` stops early and logs, and the caller's
-          next poll retries it. Infra is retried indefinitely and **never** raises out of
-          ``tick`` (so an idiomatic ``while True: try: tick() except Exception`` poller is not
-          killed by a transient outage — SCP-C-034) and never dead-lettered (SCP-C-013).
+        * :class:`StoreError` reaching ``tick`` — our DB failed at a transaction boundary or a
+          persist (load / save / delete) — is infrastructure: the event is rolled back and left
+          queued (no attempt burned), this ``tick`` stops early and logs, and the caller's next
+          poll retries it. Infra is retried indefinitely and **never** raises out of ``tick`` (so
+          an idiomatic ``while True: try: tick() except Exception`` poller is not killed by a
+          transient outage — SCP-C-034) and never dead-lettered (SCP-C-013).
         * any other ``Exception`` — chart logic, unserializable WM, undecodable session or
           payload, unknown session, or a handler's *own* bare sqlite error — is poison: back
           off, then dead-letter past the cap (#24 / SCP-C-019/027/028/029).
         * ``BaseException`` — a crash: propagate, roll back, no attempt burned (bug #21).
 
-        (Cascade ``<send>`` failures that are *not* store failures — e.g. an unserializable send
-        payload — follow the engine's ordinary executable-content error semantics: they become
-        ``error.execution`` for the chart to handle, like any other bad executable content.)"""
+        A store failure that happens *inside* ``process_event`` (a cascade ``<send>``) is not on
+        this list: because :class:`StoreError` is an ordinary ``Exception`` it is caught by the
+        engine's executable-content handling and becomes ``error.execution`` (the send isn't
+        scheduled), like any other bad executable content — see :class:`StoreError` (SCP-C-035)."""
         delivered = 0
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now
@@ -567,6 +604,7 @@ class DurableRuntime:
                 # accepted vs the idle-lock contention it removes).
                 if self.store.peek_one_due(t) is None:
                     break
+                status = None
                 with self.store.atomic():  # one transaction PER EVENT
                     row = self.store.peek_one_due(t)
                     if row is None:
@@ -595,10 +633,13 @@ class DurableRuntime:
                     except Exception as exc:  # noqa: BLE001 — poison (handler / data / unknown)
                         self._park_or_backoff(row, session_id, t, exc)
                         continue
-                    if status == "dropped":
-                        logger.debug("durable: dropped event for stopped session %r", session_id)
-                    else:
-                        delivered += 1
+                # Count only AFTER atomic() has committed: a COMMIT-boundary StoreError raises
+                # here (out of the `with`), skips this, and is caught below — so a not-yet-
+                # persisted event is never counted as delivered (SCP-C-039).
+                if status == "delivered":
+                    delivered += 1
+                elif status == "dropped":
+                    logger.debug("durable: dropped event for stopped session %r", session_id)
             except StoreError as exc:
                 # Infrastructure failure anywhere in this event's transaction: atomic() has
                 # rolled it back, so the event is still queued with no attempt burned. Stop this
