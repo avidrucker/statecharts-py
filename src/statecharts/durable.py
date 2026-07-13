@@ -61,7 +61,8 @@ DB operations in a :class:`StoreError`.
 * A ``BaseException`` (``SystemExit``/``KeyboardInterrupt``) is treated as a *crash*: it
   propagates, the :meth:`SqliteStore.atomic` block rolls back, and **no** attempt is burned —
   so the event is redelivered and applied exactly once (bug #21), never mistaken for poison.
-  (:class:`StoreError` is itself a ``BaseException`` for this reason — see its docstring.)
+  (:class:`StoreError` is an ordinary ``Exception`` that :meth:`DurableRuntime.tick` catches and
+  retries — it is *not* a crash; see its docstring.)
 
 Note a deliberate consequence: a *healthy* event that keeps failing for a non-payload,
 non-infrastructure reason (e.g. a datamodel value that is never JSON-serializable, or a
@@ -306,6 +307,15 @@ class SqliteStore:
             self.conn.rollback()
         except sqlite3.Error:
             pass
+
+    def recover(self) -> None:
+        """Roll back a transaction left open by a prior commit-then-rollback *double* failure (a
+        badly degraded store). Rolling it back both un-wedges the connection — the next
+        ``BEGIN`` can start again — and discards the un-committed partial delivery, so the event
+        is redelivered cleanly (exactly-once preserved). A no-op when there's nothing open, and
+        best-effort while the store is still failing (SCP-C-041)."""
+        if self.conn.in_transaction:
+            self._rollback_quietly()
 
     @contextmanager
     def atomic(self):
@@ -594,6 +604,10 @@ class DurableRuntime:
         this list: because :class:`StoreError` is an ordinary ``Exception`` it is caught by the
         engine's executable-content handling and becomes ``error.execution`` (the send isn't
         scheduled), like any other bad executable content — see :class:`StoreError` (SCP-C-035)."""
+        # Self-heal from a transaction a prior tick left open by a commit+rollback double failure
+        # (SCP-C-041): clears the wedge and rolls back that tick's un-committed partial delivery,
+        # so the event is redelivered cleanly once the store is healthy.
+        self.store.recover()
         delivered = 0
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now

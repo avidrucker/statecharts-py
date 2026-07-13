@@ -414,6 +414,46 @@ def test_durable_commit_failure_does_not_wedge_or_overcount():
     store.close()
 
 
+def test_durable_self_heals_after_a_commit_and_rollback_double_failure():
+    """SCP-C-041: if COMMIT and its compensating ROLLBACK BOTH fail (a badly degraded store),
+    the connection is left mid-transaction. A later tick must clear that stale transaction and
+    resume delivering once the store is healthy, rather than wedging forever on 'cannot start a
+    transaction within a transaction' — and the un-committed partial delivery is rolled back, so
+    the event is delivered exactly once."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+
+    outage = {"commit": 1, "rollback": 1}
+    class _FlakyConn:
+        def __init__(self, real):
+            self._real = real
+        def commit(self):
+            if outage["commit"] > 0:
+                outage["commit"] -= 1
+                raise sqlite3.OperationalError("commit failed")
+            return self._real.commit()
+        def rollback(self):
+            if outage["rollback"] > 0:
+                outage["rollback"] -= 1
+                raise sqlite3.OperationalError("rollback failed")
+            return self._real.rollback()
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+    store.conn = _FlakyConn(store.conn)
+
+    rt.tick()  # commit fails, and the compensating rollback ALSO fails -> transaction left open
+    assert store.conn.in_transaction, "precondition: connection was left mid-transaction"
+
+    n = rt.tick()  # store healthy now: must self-heal (roll back the stale txn) and deliver
+    assert n == 1, "the queue recovered after the double failure, not wedged"
+    assert "b" in rt.load("s1").configuration, rt.load("s1").configuration
+    assert store.dead_letters() == []
+    store.close()
+
+
 def test_durable_tick_does_not_let_a_store_error_escape_and_crash_a_poller():
     """SCP-C-034: a StoreError reaching tick() never escapes it. tick() catches it internally
     and returns, so an idiomatic supervisor loop is not killed by a transient store outage — the
