@@ -8,17 +8,24 @@ Research/design spike for [#6](https://github.com/avidrucker/statecharts-py/issu
 ## Current state (SQLite)
 
 `durable.py` persists two tables — `sessions` (working memory as JSON) and `timers` (the
-durable mailbox: `id, session_id, due, event, sendid`) — with indexes `timers_due(due)` and
-`timers_session(session_id)`. Delivery (`SqliteStore.claim_due` + `DurableRuntime.tick`):
+durable mailbox: `id, session_id, due, event, attempts, sendid`) — with indexes
+`timers_due(due)` and `timers_session(session_id)`. Delivery (`DurableRuntime.tick`) is
+**one event per transaction**:
 
-1. `claim_due(now)` — `BEGIN IMMEDIATE`, `SELECT ... WHERE due<=? ORDER BY due, id`, then
-   `DELETE WHERE id=?` for each row, **commit**. One exclusive write txn → safe for multiple
-   processes on one machine.
-2. `tick` then calls `_deliver` per claimed event: load session, `process_event`,
-   `save_session` (persist WM) — **in a separate transaction**.
+1. `peek_one_due(now)` — `SELECT ... WHERE due<=? ORDER BY due, id LIMIT 1` (the single oldest
+   due timer), **without** deleting it.
+2. Inside one `atomic()` write transaction: `_deliver` (load session, `process_event`,
+   `save_session`) **and** `delete_timer` commit together — so a crash/error rolls back the
+   whole event (exactly-once, bug #21) rather than losing it between two transactions.
 
-The docstring says the schema/queries "port directly to Postgres … replace `claim_due`'s
-transaction with `SELECT ... FOR UPDATE SKIP LOCKED`." That's directionally right, but the
+> The earlier batch primitive `SqliteStore.claim_due` (delete-all-due-then-return) was
+> **removed** in the #24/#25 rework: its delete-before-deliver order lost the whole co-due
+> batch if one row failed to decode, exactly the head-of-line/lost-on-crash hazard the
+> per-event peek path fixes. The Postgres port below does its own claiming via
+> `FOR UPDATE SKIP LOCKED` + a lease, so nothing reusable was lost.
+
+The per-event claim query is still `WHERE due <= now ORDER BY due, id`; the port replaces its
+transaction with `SELECT ... FOR UPDATE SKIP LOCKED`. That's directionally right, but the
 port has three real decisions to make first.
 
 ## RQ1 — Indexing under `FOR UPDATE SKIP LOCKED`
@@ -115,9 +122,11 @@ Temporal's replay-workflow-code model ([backend.how](https://backend.how/posts/t
 
 **`[perf/feat] PostgresStore: durable store backend with SKIP LOCKED lease delivery`**
 - Add a `PostgresStore` mirroring the `SqliteStore` interface (`save_session`/`load_session`/
-  `enqueue`/`cancel`/`claim_due`/`next_due`).
+  `enqueue`/`cancel`/`peek_one_due`+`delete_timer` (or a leased `claim`)/`next_due`).
 - Schema: `timers(due, id)` index + `status`/`claimed_at` lease columns per RQ2(b).
-- `claim_due`: `SELECT ... WHERE due<=now AND status='ready' ORDER BY due, id FOR UPDATE SKIP LOCKED`, mark in-flight, delete on successful persist, lease-expiry re-claim.
+- Claim (a new Postgres-only lease primitive, not the removed SQLite `claim_due`):
+  `SELECT ... WHERE due<=now AND status='ready' ORDER BY due, id FOR UPDATE SKIP LOCKED`,
+  mark in-flight, delete on successful persist, lease-expiry re-claim.
 - Document the at-least-once + idempotency contract (RQ3) in the durable module and the
   [behavior register](../reference/behavior-register.md).
 - Tests: a fake two-worker race (disjoint claims), a crash-between-claim-and-persist

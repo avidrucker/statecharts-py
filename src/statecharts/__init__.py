@@ -42,7 +42,10 @@ from .event_queue import Clock, ManualClock, MemoryEventQueue
 from .events import Event, coerce_event, event_matches
 from . import store
 from .aio import AsyncSession
-from .durable import ChartRegistry, DurableRuntime, SqliteEventQueue, SqliteStore
+from .durable import (
+    ChartRegistry, DurableRuntime, SqliteEventQueue, SqliteStore,
+    StoreError, UnknownSessionError,
+)
 from .simple import Session
 from .store import NormalizedDataModel, initial_store, resolve_actors, resolve_aliases
 from .viz import to_dot, to_mermaid
@@ -104,4 +107,6 @@ __all__ = [
     "SqliteEventQueue",
     "ChartRegistry",
     "DurableRuntime",
+    "StoreError",
+    "UnknownSessionError",
 ]

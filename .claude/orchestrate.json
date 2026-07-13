@@ -1,0 +1,10 @@
+{
+  "claims": {
+    "enabled": true,
+    "dir": "claims-data",
+    "prefix": "SCP",
+    "agentScoped": null,
+    "evidenceDir": "claims-data/evidence",
+    "overloadedTerms": ["claim", "tick", "store", "atomic", "recover", "defer", "poison", "backoff", "session"]
+  }
+}
