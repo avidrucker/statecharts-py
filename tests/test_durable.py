@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 
 from statecharts import (
@@ -336,3 +337,129 @@ def test_durable_baseexception_propagates_without_burning_an_attempt():
     assert row["attempts"] == 0, "a crash must not burn a delivery attempt"
     assert store.dead_letters() == [], "a crash must never dead-letter"
     store.close()
+
+
+def test_durable_store_error_retries_forever_never_dead_letters():
+    """SCP-C-013 / SCP-Q-002: a store/infrastructure error (sqlite3.OperationalError from the
+    persistence layer — disk full / db locked / I/O) is NOT the event's fault. It must be
+    treated like a crash: propagate, roll back, burn no attempt, and be retried indefinitely —
+    never counted toward the poison cap and never dead-lettered."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+
+    real = rt._deliver
+    outage = {"n": 3}  # DB unavailable for the first 3 ticks, then recovers
+    def flaky(sid, ev):
+        if outage["n"] > 0:
+            outage["n"] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        return real(sid, ev)
+    rt._deliver = flaky
+
+    for _ in range(3):
+        try:
+            rt.tick()
+        except sqlite3.OperationalError:
+            pass  # infra error propagates (retry indefinitely), like a crash
+        row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
+        assert row is not None, "healthy event survives the outage"
+        assert row["attempts"] == 0, "an infra error must not burn a delivery attempt"
+        assert store.dead_letters() == [], "an infra error must never dead-letter a healthy event"
+
+    rt.tick()  # DB recovered -> delivered normally
+    assert "b" in rt.load("s1").configuration, rt.load("s1").configuration
+    assert store.dead_letters() == []
+    store.close()
+
+
+def _fifo_chart():
+    # start --A--> mid --B--> end;  B is NOT accepted in `start` (consumed, no transition).
+    return statechart({"initial": "start"},
+        state({"id": "start"}, on("A", "mid")),
+        state({"id": "mid"}, on("B", "end")),
+        final({"id": "end"}),
+    )
+
+
+def test_durable_failed_event_is_not_overtaken_by_a_later_same_session_event():
+    """SCP-C-011: within one session, a later event must not be delivered ahead of an earlier
+    one that is transiently failing. A must land before B; if B (only valid after A) were
+    delivered first it would be consumed as a no-op and the machine could never reach `end`."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _fifo_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "A")   # enqueued first -> oldest
+    rt.enqueue("s1", "B")
+
+    real = rt._deliver
+    fail = {"A": 1}         # A fails once (transient), then succeeds
+    def deliver(sid, ev):
+        if ev.name == "A" and fail["A"] > 0:
+            fail["A"] -= 1
+            raise RuntimeError("A transiently fails")
+        return real(sid, ev)
+    rt._deliver = deliver
+
+    rt.tick()  # A fails -> deferred; B must be held behind it, NOT delivered out of order
+    assert "start" in rt.load("s1").configuration, rt.load("s1").configuration
+
+    store.clock.advance(10_000.0); rt.tick()   # A now delivers: start -> mid
+    store.clock.advance(10_000.0); rt.tick()   # then B, in order: mid -> end
+    assert "end" in rt.load("s1").configuration, rt.load("s1").configuration
+    assert store.dead_letters() == []
+    store.close()
+
+
+def test_durable_zero_backoff_base_still_spaces_retries_within_a_tick():
+    """SCP-C-018: BACKOFF_BASE_S is advertised tunable; even set to 0 a failed timer must not
+    be re-peeked at a fixed clock and burn every attempt in a single tick — a floor keeps its
+    next due time strictly in the future."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.BACKOFF_BASE_S = 0.0
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
+
+    rt.tick()  # a single tick at a fixed clock
+
+    row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
+    assert row is not None and row["attempts"] == 1, "only one attempt burned per fixed-clock tick"
+    assert store.dead_letters() == [], "zero backoff must not collapse all attempts into one tick"
+    store.close()
+
+
+def test_durable_duplicate_attempts_alter_is_the_guarded_error():
+    """SCP-C-016: pin the exact error the concurrent-migration guard swallows — a second
+    `ALTER TABLE ... ADD COLUMN attempts` (the losing worker in a start-up race) raises
+    sqlite3.OperationalError('duplicate column name'), which SqliteStore.__init__ tolerates
+    when the column is already present."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE timers(id INTEGER PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0)")
+    try:
+        conn.execute("ALTER TABLE timers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        assert False, "expected a duplicate-column error"
+    except sqlite3.OperationalError as exc:
+        assert "duplicate column" in str(exc).lower()
+    conn.close()
+
+    # And opening an old-schema DB twice (winner then loser view) must not crash.
+    path = tempfile.mktemp(suffix=".scdb")
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE timers(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+              "due REAL NOT NULL, event TEXT NOT NULL, sendid TEXT)")
+    c.commit(); c.close()
+    try:
+        s1 = SqliteStore(path, clock=ManualClock())
+        s2 = SqliteStore(path, clock=ManualClock())  # second opener: column already added
+        cols = {r["name"] for r in s2.conn.execute("PRAGMA table_info(timers)")}
+        assert "attempts" in cols
+        s1.close(); s2.close()
+    finally:
+        if os.path.exists(path):
+            os.remove(path)

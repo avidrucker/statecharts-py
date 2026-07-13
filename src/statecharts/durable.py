@@ -11,9 +11,9 @@ by name in a :class:`ChartRegistry` rather than persisted; only JSON-able workin
 memory and events go in the database.
 
 Scope: SQLite gives durability and safe multi-process access on a single machine.
-The schema/queries port directly to Postgres for true multi-node distribution
-(replace :meth:`SqliteStore.claim_due`'s transaction with
-``SELECT ... FOR UPDATE SKIP LOCKED``).
+The schema/queries port to Postgres for true multi-node distribution: the Postgres
+port replaces the peek-deliver-delete cycle with a ``SELECT ... FOR UPDATE SKIP LOCKED``
+lease (see ``docs/design/postgres-durability.md``).
 
 Delivery contract: :meth:`DurableRuntime.tick` delivers **one event per transaction** —
 claiming a due timer, persisting the resulting working memory, and any cascade ``<send>``
@@ -21,28 +21,41 @@ it enqueues all run inside a single :meth:`SqliteStore.atomic` transaction. A cr
 during delivery rolls that event back (so it is redelivered on the next tick and takes
 effect **exactly once** — no lost or double-applied events; bug #21), while events already
 delivered in the same tick keep their committed progress (independent sessions are
-isolated — one failing event never reverts another's). The multi-worker Postgres port
-instead uses a lease/visibility-timeout for **at-least-once** delivery (which then requires
+isolated — one failing event never reverts another's). Per-session order is preserved even
+under failure: if a session's event fails and is backed off, that session's later due events
+wait behind it rather than overtaking it (SCP-C-011). The multi-worker Postgres port instead
+uses a lease/visibility-timeout for **at-least-once** delivery (which then requires
 idempotent handlers) — see ``docs/design/postgres-durability.md``.
+
+**"Exactly once" covers working memory, not external side effects.** The atomicity above is
+about the persisted state (working memory + timers). If a guard/action performs an *external*
+side effect (an HTTP call, a notification) and then a later step fails, the working-memory
+write is rolled back but the side effect is not — and a poison retry re-runs the handler. So
+side-effecting executable content must be **idempotent** or externally deduplicated (SCP-C-015;
+same requirement as the Postgres at-least-once port).
 
 Poison events: delivery failures are classified by exception type.
 
-* An ``Exception`` is treated as *poison*: the timer's attempt count is incremented and its
-  ``due`` is pushed into the future (exponential **backoff**), so a briefly-unavailable
+* A non-DB ``Exception`` is treated as *poison*: the timer's attempt count is incremented and
+  its ``due`` is pushed into the future (exponential **backoff**), so a briefly-unavailable
   dependency gets a real spaced retry window and the failing event can't head-of-line-block
   newer events. A warning is logged on *every* attempt. After
   ``DurableRuntime.DEAD_LETTER_CAP`` (default 5) failed attempts the event is moved to the
   ``dead_letters`` table — never silently dropped. An event whose stored payload can't be
   decoded at all is unrecoverable and is dead-lettered immediately.
+* A ``sqlite3.Error`` (the store's own disk-full / db-locked / I/O failure) is *not* poison:
+  it propagates out of :meth:`DurableRuntime.tick` and rolls back, so a healthy event caught
+  in an infrastructure outage is retried indefinitely and never dead-lettered (SCP-C-013).
 * A ``BaseException`` (``SystemExit``/``KeyboardInterrupt``) is treated as a *crash*: it
-  propagates out of :meth:`DurableRuntime.tick`, the :meth:`SqliteStore.atomic` block rolls
-  back, and **no** attempt is burned — so the event is redelivered and applied exactly once
-  (bug #21), never mistaken for poison.
+  propagates, the :meth:`SqliteStore.atomic` block rolls back, and **no** attempt is burned —
+  so the event is redelivered and applied exactly once (bug #21), never mistaken for poison.
 
-Note a deliberate consequence: a *healthy* event that keeps failing for a non-payload reason
-(e.g. a datamodel value that is never JSON-serializable) is parked after the cap by design —
-preserved in ``dead_letters`` with a loud warning, not lost. Inspect parked events with
-:meth:`SqliteStore.dead_letters`.
+Note a deliberate consequence: a *healthy* event that keeps failing for a non-payload,
+non-infrastructure reason (e.g. a datamodel value that is never JSON-serializable, or a
+deterministic bug in a guard/action) is parked after the cap **by design** — it does not fail
+loud. It is preserved in ``dead_letters`` with a per-attempt warning, not lost, so the
+operator signal is the WARNING logs plus the queryable ``dead_letters`` table rather than a
+raised exception (SCP-C-012). Inspect parked events with :meth:`SqliteStore.dead_letters`.
 
 Limitation: active child ``<invoke>`` sessions are not persisted (they live only in
 an in-process run); durable sessions are for the persist-between-external-events use
@@ -55,7 +68,7 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -181,10 +194,18 @@ class SqliteStore:
             self.conn.execute("PRAGMA journal_mode=WAL")  # durability + concurrent readers
         self.conn.executescript(_SCHEMA)
         # Migrate a pre-existing timers table that lacks the `attempts` column
-        # (CREATE TABLE IF NOT EXISTS won't add a column to an existing table).
+        # (CREATE TABLE IF NOT EXISTS won't add a column to an existing table). Guard against
+        # a start-up race: two processes opening an old DB at once can both see the column
+        # missing and both ALTER; the loser gets "duplicate column name" — tolerate it once
+        # the column is present, rather than crashing in __init__ (SCP-C-016).
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(timers)")}
         if "attempts" not in cols:
-            self.conn.execute("ALTER TABLE timers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            try:
+                self.conn.execute("ALTER TABLE timers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(timers)")}
+                if "attempts" not in cols:
+                    raise  # a real failure, not the concurrent-migration race
         self.conn.commit()
         self.clock = clock or Clock()
         self._depth = 0  # >0 while inside atomic(): per-call commits are deferred
@@ -196,7 +217,7 @@ class SqliteStore:
     @contextmanager
     def atomic(self):
         """A write transaction that batches the otherwise per-call commits of
-        ``save_session`` / ``enqueue`` / ``cancel`` / ``claim_due`` into one unit, so a
+        ``save_session`` / ``enqueue`` / ``cancel`` / ``defer`` into one unit, so a
         crash mid-batch rolls the whole thing back. This is what makes delivery atomic:
         claiming a timer, persisting the resulting working memory, and any cascade
         ``<send>`` it enqueues all commit together, or not at all (bug #21). Nesting is
@@ -284,24 +305,6 @@ class SqliteStore:
         row = self.conn.execute("SELECT MIN(due) AS d FROM timers").fetchone()
         return row["d"] if row and row["d"] is not None else None
 
-    def claim_due(self, now: float) -> List[Tuple[str, Event]]:
-        """Atomically take all timers due at/<= ``now`` (oldest first) and return
-        ``(session_id, event)`` pairs. The single write transaction is what makes this
-        safe for multiple processes on one machine. A batch primitive kept for the store
-        interface (and the Postgres port, #19); delivery (:meth:`DurableRuntime.tick`)
-        instead peeks one event at a time (:meth:`peek_one_due`) so a failing event can be
-        retried / dead-lettered without disturbing its co-due neighbours."""
-        with self.atomic():
-            rows = self.conn.execute(
-                "SELECT id, session_id, event FROM timers WHERE due<=? ORDER BY due, id",
-                (now,),
-            ).fetchall()
-            if rows:
-                self.conn.executemany(
-                    "DELETE FROM timers WHERE id=?", [(r["id"],) for r in rows]
-                )
-        return [(r["session_id"], event_from_jsonable(json.loads(r["event"]))) for r in rows]
-
     def peek_one_due(self, now: float) -> Optional[sqlite3.Row]:
         """The single oldest due timer (``due <= now``), **without** deleting it. Returns a
         row (``id, session_id, due, event, attempts``) or ``None``. Delivery
@@ -319,12 +322,22 @@ class SqliteStore:
         self.conn.execute("DELETE FROM timers WHERE id=?", (timer_id,))
         self._commit()
 
-    def defer(self, timer_id: int, new_due: float) -> None:
-        """Record a failed delivery attempt and reschedule the timer to ``new_due`` (backoff),
-        atomically. Because the event is no longer due until ``new_due`` it can't head-of-line
-        -block newer events, and it gets a real spaced retry window (#24, SCP-C-001)."""
+    def defer(self, timer_id: int, session_id: str, new_due: float, now: float) -> None:
+        """Record a failed delivery attempt for ``timer_id`` and reschedule it to ``new_due``
+        (backoff), atomically. Because the event is no longer due until ``new_due`` it can't
+        head-of-line-block *other* sessions and it gets a real spaced retry window (#24,
+        SCP-C-001).
+
+        The same session's other currently-due events are pushed to ``new_due`` too (without
+        counting an attempt against them), so a later event can never overtake the failed
+        earlier one — per-session FIFO order is preserved (SCP-C-011) while other sessions are
+        untouched."""
         self.conn.execute(
             "UPDATE timers SET attempts=attempts+1, due=? WHERE id=?", (new_due, timer_id)
+        )
+        self.conn.execute(
+            "UPDATE timers SET due=? WHERE session_id=? AND due<=? AND id<>?",
+            (new_due, session_id, now, timer_id),
         )
         self._commit()
 
@@ -391,8 +404,10 @@ class DurableRuntime:
     #: Delivery attempts before an event is dead-lettered (#23 ruling). Tunable.
     DEAD_LETTER_CAP = 5
     #: Exponential-backoff base (seconds) for a failed delivery: attempt ``n`` reschedules
-    #: to ``now + BACKOFF_BASE_S * 2**(n-1)``, capped at ``BACKOFF_MAX_S``.
+    #: to ``now + BACKOFF_BASE_S * 2**(n-1)``, clamped to ``[BACKOFF_MIN_S, BACKOFF_MAX_S]``.
+    #: The min is a floor so ``due`` always advances even if BASE is tuned to 0 (SCP-C-018).
     BACKOFF_BASE_S = 1.0
+    BACKOFF_MIN_S = 1e-6
     BACKOFF_MAX_S = 3600.0
 
     def __init__(self, store: SqliteStore, registry: ChartRegistry, *,
@@ -474,9 +489,15 @@ class DurableRuntime:
                         self._deliver(session_id, event)
                         self.store.delete_timer(timer_id)
                     delivered += 1
-                except Exception as exc:  # noqa: BLE001 — delivery error, not a crash
-                    # A crash (BaseException) is intentionally NOT caught: it propagates,
-                    # atomic() rolls back, and no attempt is burned (bug #21). Only a normal
+                except sqlite3.Error:
+                    # A store/infrastructure error (disk full, db locked, I/O) is NOT the
+                    # event's fault: propagate it so atomic() rolls back and the event is
+                    # retried indefinitely, exactly-once — never counted toward the poison cap
+                    # (SCP-C-013 / SCP-Q-002). Treated like a crash: no attempt burned.
+                    raise
+                except Exception as exc:  # noqa: BLE001 — delivery error, poison (not a crash)
+                    # A crash (BaseException) is intentionally NOT caught either: it propagates,
+                    # atomic() rolls back, and no attempt is burned (bug #21). Only a non-DB
                     # Exception is poison: back off, then dead-letter past the cap (#24).
                     n = row["attempts"] + 1
                     if n >= self.DEAD_LETTER_CAP:
@@ -486,8 +507,12 @@ class DurableRuntime:
                             session_id, n, exc,
                         )
                     else:
+                        # A floor keeps `due` strictly in the future even if BACKOFF_BASE_S is
+                        # tuned to 0, so a failed timer can't be re-peeked and burn every
+                        # attempt within one fixed-clock tick (SCP-C-018).
                         backoff = min(self.BACKOFF_BASE_S * (2 ** (n - 1)), self.BACKOFF_MAX_S)
-                        self.store.defer(timer_id, t + backoff)
+                        backoff = max(backoff, self.BACKOFF_MIN_S)
+                        self.store.defer(timer_id, session_id, t + backoff, t)
                         logger.warning(
                             "durable: delivery failed for session %r (attempt %d/%d); "
                             "retrying after %.3gs backoff: %s",
