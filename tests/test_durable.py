@@ -414,6 +414,57 @@ def test_durable_commit_failure_does_not_wedge_or_overcount():
     store.close()
 
 
+def test_durable_tick_inside_a_caller_transaction_keeps_its_writes():
+    """SCP-C-044: tick()'s entry recover() must only clear a STALE leftover transaction (no
+    active atomic()), never a transaction a caller legitimately holds. A caller batching
+    enqueue+deliver in one atomic() must keep its enqueued event."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+
+    with store.atomic():
+        rt.enqueue("s1", "go")   # pending inside the caller's transaction
+        rt.tick()                # recover() at entry must NOT roll this back
+
+    assert "b" in rt.load("s1").configuration, rt.load("s1").configuration
+    assert store.next_due() is None
+    store.close()
+
+
+def test_durable_enqueue_commit_failure_does_not_phantom_commit_a_later_write():
+    """SCP-C-045: if a standalone write's COMMIT fails, the store must roll back so the failed
+    INSERT does not linger in an open transaction and get phantom-committed by the next write."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+
+    fail = {"n": 1}
+    class _FlakyConn:
+        def __init__(self, real):
+            self._real = real
+        def commit(self):
+            if fail["n"] > 0:
+                fail["n"] -= 1
+                raise sqlite3.OperationalError("commit failed")
+            return self._real.commit()
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+    store.conn = _FlakyConn(store.conn)
+
+    try:
+        rt.enqueue("s1", "a-event")   # its commit fails -> caller is told it failed
+    except StoreError:
+        pass
+    rt.enqueue("s1", "b-event")       # commits normally; must NOT drag the failed A along
+
+    names = [json.loads(r["event"])["name"]
+             for r in store.conn.execute("SELECT event FROM timers ORDER BY id")]
+    assert names == ["b-event"], f"the failed enqueue must not be phantom-committed; got {names}"
+    store.close()
+
+
 def test_durable_self_heals_after_a_commit_and_rollback_double_failure():
     """SCP-C-041: if COMMIT and its compensating ROLLBACK BOTH fail (a badly degraded store),
     the connection is left mid-transaction. A later tick must clear that stale transaction and

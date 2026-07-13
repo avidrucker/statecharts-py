@@ -290,15 +290,6 @@ class SqliteStore:
         except sqlite3.Error as exc:
             raise StoreError(str(exc)) from exc
 
-    def _txn(self, fn) -> None:
-        """Run a transaction-control call (``conn.commit`` / ``conn.rollback``), translating a
-        ``sqlite3.Error`` into :class:`StoreError` so a failure at a transaction *boundary* is
-        classified as infrastructure like every other store op (SCP-C-032/033)."""
-        try:
-            fn()
-        except sqlite3.Error as exc:
-            raise StoreError(str(exc)) from exc
-
     def _rollback_quietly(self) -> None:
         """Best-effort rollback used while already unwinding an error: it clears an aborted
         transaction (so the *next* ``BEGIN`` can start) without masking the original exception
@@ -313,8 +304,12 @@ class SqliteStore:
         badly degraded store). Rolling it back both un-wedges the connection — the next
         ``BEGIN`` can start again — and discards the un-committed partial delivery, so the event
         is redelivered cleanly (exactly-once preserved). A no-op when there's nothing open, and
-        best-effort while the store is still failing (SCP-C-041)."""
-        if self.conn.in_transaction:
+        best-effort while the store is still failing (SCP-C-041).
+
+        Guarded by ``_depth == 0``: while an :meth:`atomic` block is active the open transaction
+        is *owned* by that block, so it must never be rolled back here — only a leftover with no
+        active owner is a stale double-failure to clear (SCP-C-044)."""
+        if self._depth == 0 and self.conn.in_transaction:
             self._rollback_quietly()
 
     @contextmanager
@@ -356,9 +351,15 @@ class SqliteStore:
             self._depth -= 1
 
     def _commit(self) -> None:
-        """Commit now, unless we're inside an ``atomic()`` block (then defer to it)."""
+        """Commit now, unless we're inside an ``atomic()`` block (then defer to it). On a commit
+        failure, roll back the pending write so it can't linger in an open transaction and be
+        phantom-committed by a later write — mirroring :meth:`atomic` (SCP-C-045)."""
         if self._depth == 0:
-            self._txn(self.conn.commit)
+            try:
+                self.conn.commit()
+            except sqlite3.Error as exc:
+                self._rollback_quietly()
+                raise StoreError(str(exc)) from exc
 
     @contextmanager
     def savepoint(self):
