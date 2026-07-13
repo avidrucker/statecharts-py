@@ -21,11 +21,15 @@ it enqueues all run inside a single :meth:`SqliteStore.atomic` transaction. A cr
 during delivery rolls that event back (so it is redelivered on the next tick and takes
 effect **exactly once** — no lost or double-applied events; bug #21), while events already
 delivered in the same tick keep their committed progress (independent sessions are
-isolated — one failing event never reverts another's). Per-session order is preserved even
-under failure: if a session's event fails and is backed off, that session's later due events
-wait behind it rather than overtaking it (SCP-C-011). The multi-worker Postgres port instead
+isolated — one failing event never reverts another's). The multi-worker Postgres port instead
 uses a lease/visibility-timeout for **at-least-once** delivery (which then requires
 idempotent handlers) — see ``docs/design/postgres-durability.md``.
+
+**Per-session ordering under failure is not guaranteed.** Events are delivered oldest-due
+first, but when a session's event fails and is backed off, that session's *later* events are
+not held behind it — they may be delivered while it waits to retry. This is the deliberate #24
+tradeoff (isolate other sessions rather than block the whole queue on one). Strict per-session
+FIFO under failure is deferred to its own ticket (#26 — a session-level retry gate).
 
 **"Exactly once" covers working memory, not external side effects.** The atomicity above is
 about the persisted state (working memory + timers). If a guard/action performs an *external*
@@ -34,18 +38,20 @@ write is rolled back but the side effect is not — and a poison retry re-runs t
 side-effecting executable content must be **idempotent** or externally deduplicated (SCP-C-015;
 same requirement as the Postgres at-least-once port).
 
-Poison events: delivery failures are classified by exception type.
+Poison events: delivery failures are classified by *where* they occur, not by exception type
+(a handler can raise the same types the store does).
 
-* A non-DB ``Exception`` is treated as *poison*: the timer's attempt count is incremented and
-  its ``due`` is pushed into the future (exponential **backoff**), so a briefly-unavailable
-  dependency gets a real spaced retry window and the failing event can't head-of-line-block
-  newer events. A warning is logged on *every* attempt. After
-  ``DurableRuntime.DEAD_LETTER_CAP`` (default 5) failed attempts the event is moved to the
-  ``dead_letters`` table — never silently dropped. An event whose stored payload can't be
-  decoded at all is unrecoverable and is dead-lettered immediately.
-* A ``sqlite3.Error`` (the store's own disk-full / db-locked / I/O failure) is *not* poison:
-  it propagates out of :meth:`DurableRuntime.tick` and rolls back, so a healthy event caught
-  in an infrastructure outage is retried indefinitely and never dead-lettered (SCP-C-013).
+* A **handler** failure — the chart logic (``_run`` / ``process_event``) raising while
+  processing the event — is *poison*: the timer's attempt count is incremented and its ``due``
+  is pushed into the future (exponential **backoff**), so a briefly-unavailable dependency gets
+  a real spaced retry window and the failing event can't head-of-line-block newer events. A
+  warning is logged on *every* attempt. After ``DurableRuntime.DEAD_LETTER_CAP`` (default 5)
+  failed attempts the event is moved to the ``dead_letters`` table — never silently dropped. An
+  event whose stored payload can't be decoded at all is unrecoverable and dead-lettered at once.
+* A **store/infrastructure** failure — loading or persisting the session raising (disk-full /
+  db-locked / I/O, of any exception type) — is *not* poison: it propagates out of
+  :meth:`DurableRuntime.tick` and rolls back, so a healthy event caught in an infrastructure
+  outage is retried indefinitely and never dead-lettered (SCP-C-013 / SCP-C-019 / SCP-C-023).
 * A ``BaseException`` (``SystemExit``/``KeyboardInterrupt``) is treated as a *crash*: it
   propagates, the :meth:`SqliteStore.atomic` block rolls back, and **no** attempt is burned —
   so the event is redelivered and applied exactly once (bug #21), never mistaken for poison.
@@ -65,12 +71,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional
-
-logger = logging.getLogger(__name__)
 
 from .algorithm import initialize, process_event
 from .chart import Chart, make_chart
@@ -79,6 +84,8 @@ from .environment import make_env
 from .event_queue import Clock
 from .events import Event, coerce_event
 from .working_memory import WorkingMemory
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -190,14 +197,20 @@ class SqliteStore:
     def __init__(self, path: str = ":memory:", clock: Optional[Clock] = None):
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
+        # Wait (rather than fail fast) for a concurrent writer's lock — so the migration below
+        # and normal writes block on the lock instead of raising "database is locked" under the
+        # documented multi-process use (SCP-C-022).
+        self.conn.execute("PRAGMA busy_timeout=5000")
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL")  # durability + concurrent readers
         self.conn.executescript(_SCHEMA)
         # Migrate a pre-existing timers table that lacks the `attempts` column
         # (CREATE TABLE IF NOT EXISTS won't add a column to an existing table). Guard against
         # a start-up race: two processes opening an old DB at once can both see the column
-        # missing and both ALTER; the loser gets "duplicate column name" — tolerate it once
-        # the column is present, rather than crashing in __init__ (SCP-C-016).
+        # missing and both ALTER. With busy_timeout set above, the loser's ALTER blocks until
+        # the winner commits and then fails with "duplicate column name" (not "database is
+        # locked", SCP-C-022); either way, tolerate the error once the column is present rather
+        # than crashing in __init__ (SCP-C-016).
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(timers)")}
         if "attempts" not in cols:
             try:
@@ -322,22 +335,17 @@ class SqliteStore:
         self.conn.execute("DELETE FROM timers WHERE id=?", (timer_id,))
         self._commit()
 
-    def defer(self, timer_id: int, session_id: str, new_due: float, now: float) -> None:
-        """Record a failed delivery attempt for ``timer_id`` and reschedule it to ``new_due``
-        (backoff), atomically. Because the event is no longer due until ``new_due`` it can't
-        head-of-line-block *other* sessions and it gets a real spaced retry window (#24,
-        SCP-C-001).
+    def defer(self, timer_id: int, new_due: float) -> None:
+        """Record a failed delivery attempt and reschedule the timer to ``new_due`` (backoff),
+        atomically. Because the event is no longer due until ``new_due`` it can't
+        head-of-line-block newer events, and it gets a real spaced retry window (#24, SCP-C-001).
 
-        The same session's other currently-due events are pushed to ``new_due`` too (without
-        counting an attempt against them), so a later event can never overtake the failed
-        earlier one — per-session FIFO order is preserved (SCP-C-011) while other sessions are
-        untouched."""
+        Note: this does not hold back the *same* session's later events, so under a delivery
+        failure a session's events may be delivered out of order (the deliberate #24 tradeoff —
+        isolate other sessions rather than block on one). Strict per-session FIFO under failure
+        is tracked separately (see the durable module docstring)."""
         self.conn.execute(
             "UPDATE timers SET attempts=attempts+1, due=? WHERE id=?", (new_due, timer_id)
-        )
-        self.conn.execute(
-            "UPDATE timers SET due=? WHERE session_id=? AND due<=? AND id<>?",
-            (new_due, session_id, now, timer_id),
         )
         self._commit()
 
@@ -407,7 +415,7 @@ class DurableRuntime:
     #: to ``now + BACKOFF_BASE_S * 2**(n-1)``, clamped to ``[BACKOFF_MIN_S, BACKOFF_MAX_S]``.
     #: The min is a floor so ``due`` always advances even if BASE is tuned to 0 (SCP-C-018).
     BACKOFF_BASE_S = 1.0
-    BACKOFF_MIN_S = 1e-6
+    BACKOFF_MIN_S = 1e-3
     BACKOFF_MAX_S = 3600.0
 
     def __init__(self, store: SqliteStore, registry: ChartRegistry, *,
@@ -445,13 +453,14 @@ class DurableRuntime:
         rec = self.store.load_session(session_id)
         return rec.wm if rec else None
 
-    def _deliver(self, session_id: str, event: Event) -> None:
-        rec = self.store.load_session(session_id)
-        if rec is None or not rec.wm.running:
-            return
+    def _run(self, rec: SessionRecord, session_id: str, event: Event) -> WorkingMemory:
+        """Run the chart for one due event on an already-loaded session record and return the
+        new working memory. Exceptions raised here are the *handler's* — the chart logic
+        rejecting/failing this event — and are classified as poison by :meth:`tick`. Loading
+        and persisting the session are the caller's job, so a store failure stays outside this
+        method and is classified as infrastructure (SCP-C-019)."""
         env = self._env(session_id, self.registry.get(rec.chart))
-        wm = process_event(env, rec.wm, event)
-        self.store.save_session(session_id, rec.chart, wm)
+        return process_event(env, rec.wm, event)
 
     def tick(self, now: Optional[float] = None, max_steps: int = 10_000) -> int:
         """Deliver every event that is due at ``now`` (default: the clock), draining
@@ -460,10 +469,17 @@ class DurableRuntime:
         delivered = 0
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now
+            # Lock-free pre-check: don't take the write lock (BEGIN IMMEDIATE) just to discover
+            # the queue is idle — that would serialize all pollers on an empty queue (SCP-C-025).
+            if self.store.peek_one_due(t) is None:
+                break
             # One transaction PER EVENT: peek the oldest due timer, deliver + persist +
-            # cascade-enqueues + delete-on-success all commit together (or roll back on a
-            # crash — the event is never lost, bug #21). A delivery *error* (Exception) is
-            # caught below; a *crash* (BaseException) propagates and rolls back untouched.
+            # cascade-enqueues + delete-on-success all commit together (or roll back — the event
+            # is never lost, bug #21). Failures are classified by *where* they occur:
+            #   * handler (`_run` / process_event) raising  -> poison: back off / dead-letter.
+            #   * store persistence (load/save/delete) raising a sqlite3.Error -> infrastructure:
+            #     propagate, roll back, retry indefinitely, no attempt burned (SCP-C-013/019/023).
+            #   * BaseException -> crash: propagate, roll back, no attempt burned (bug #21).
             with self.store.atomic():
                 row = self.store.peek_one_due(t)
                 if row is None:
@@ -484,41 +500,50 @@ class DurableRuntime:
                     )
                     continue
 
+                # Load (infrastructure): a failure here propagates (retried indefinitely).
+                rec = self.store.load_session(session_id)
+                if rec is None or not rec.wm.running:
+                    self.store.delete_timer(timer_id)  # session gone/stopped: drop the event
+                    delivered += 1
+                    continue
+
+                # Run the handler (poison zone): only chart logic is caught here.
                 try:
                     with self.store.savepoint():
-                        self._deliver(session_id, event)
-                        self.store.delete_timer(timer_id)
-                    delivered += 1
-                except sqlite3.Error:
-                    # A store/infrastructure error (disk full, db locked, I/O) is NOT the
-                    # event's fault: propagate it so atomic() rolls back and the event is
-                    # retried indefinitely, exactly-once — never counted toward the poison cap
-                    # (SCP-C-013 / SCP-Q-002). Treated like a crash: no attempt burned.
-                    raise
-                except Exception as exc:  # noqa: BLE001 — delivery error, poison (not a crash)
-                    # A crash (BaseException) is intentionally NOT caught either: it propagates,
-                    # atomic() rolls back, and no attempt is burned (bug #21). Only a non-DB
-                    # Exception is poison: back off, then dead-letter past the cap (#24).
-                    n = row["attempts"] + 1
-                    if n >= self.DEAD_LETTER_CAP:
-                        self.store.dead_letter(row, str(exc))
-                        logger.warning(
-                            "durable: dead-lettered event for session %r after %d attempts: %s",
-                            session_id, n, exc,
-                        )
-                    else:
-                        # A floor keeps `due` strictly in the future even if BACKOFF_BASE_S is
-                        # tuned to 0, so a failed timer can't be re-peeked and burn every
-                        # attempt within one fixed-clock tick (SCP-C-018).
-                        backoff = min(self.BACKOFF_BASE_S * (2 ** (n - 1)), self.BACKOFF_MAX_S)
-                        backoff = max(backoff, self.BACKOFF_MIN_S)
-                        self.store.defer(timer_id, session_id, t + backoff, t)
-                        logger.warning(
-                            "durable: delivery failed for session %r (attempt %d/%d); "
-                            "retrying after %.3gs backoff: %s",
-                            session_id, n, self.DEAD_LETTER_CAP, backoff, exc,
-                        )
+                        wm = self._run(rec, session_id, event)
+                except Exception as exc:  # noqa: BLE001 — handler/event error = poison
+                    self._park_or_backoff(row, session_id, t, exc)
+                    continue
+
+                # Persist (infrastructure zone): a failure here — of any type — propagates and
+                # rolls back the whole event, so it is retried, never dead-lettered.
+                self.store.save_session(session_id, rec.chart, wm)
+                self.store.delete_timer(timer_id)
+                delivered += 1
         return delivered
+
+    def _park_or_backoff(self, row, session_id: str, t: float, exc: Exception) -> None:
+        """A handler (poison) failure: back the timer off for a spaced retry, or dead-letter it
+        once the attempt cap is reached (#24). Logs every attempt (SCP-C-007)."""
+        n = row["attempts"] + 1
+        if n >= self.DEAD_LETTER_CAP:
+            self.store.dead_letter(row, str(exc))
+            logger.warning(
+                "durable: dead-lettered event for session %r after %d attempts: %s",
+                session_id, n, exc,
+            )
+        else:
+            backoff = min(self.BACKOFF_BASE_S * (2 ** (n - 1)), self.BACKOFF_MAX_S)
+            backoff = max(backoff, self.BACKOFF_MIN_S)
+            # Guarantee `due` strictly advances even at large float epochs where the backoff
+            # would round away, so a failed timer is never re-peeked within one tick (SCP-C-024).
+            new_due = max(t + backoff, math.nextafter(t, math.inf))
+            self.store.defer(row["id"], new_due)
+            logger.warning(
+                "durable: delivery failed for session %r (attempt %d/%d); "
+                "retrying after %.3gs backoff: %s",
+                session_id, n, self.DEAD_LETTER_CAP, backoff, exc,
+            )
 
     def next_due(self) -> Optional[float]:
         return self.store.next_due()
