@@ -340,10 +340,10 @@ def test_durable_baseexception_propagates_without_burning_an_attempt():
 
 
 def test_durable_store_error_retries_forever_never_dead_letters():
-    """SCP-C-013 / SCP-Q-002: a store/infrastructure error (StoreError from the persistence
-    layer — disk full / db locked / I/O) is NOT the event's fault. It must be treated like a
-    crash: propagate, roll back, burn no attempt, and be retried indefinitely — never counted
-    toward the poison cap and never dead-lettered."""
+    """SCP-C-013 / SCP-C-034: a store/infrastructure error (StoreError from the persistence
+    layer — disk full / db locked / I/O) is NOT the event's fault. tick() rolls it back, leaves
+    the event queued (no attempt burned), and does NOT raise — the caller's next poll retries it,
+    indefinitely, never counting toward the poison cap and never dead-lettering."""
     store = SqliteStore(":memory:", clock=ManualClock())
     reg = ChartRegistry().register("c", _poison_chart())
     rt = DurableRuntime(store, reg)
@@ -360,10 +360,7 @@ def test_durable_store_error_retries_forever_never_dead_letters():
     store.save_session = flaky_save
 
     for _ in range(3):
-        try:
-            rt.tick()
-        except StoreError:
-            pass  # infra error propagates (retry indefinitely), like a crash
+        rt.tick()  # must NOT raise (SCP-C-034) — a poller loop survives the outage
         row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
         assert row is not None, "healthy event survives the outage"
         assert row["attempts"] == 0, "an infra error must not burn a delivery attempt"
@@ -371,6 +368,27 @@ def test_durable_store_error_retries_forever_never_dead_letters():
 
     rt.tick()  # DB recovered -> delivered normally
     assert "b" in rt.load("s1").configuration, rt.load("s1").configuration
+    assert store.dead_letters() == []
+    store.close()
+
+
+def test_durable_tick_does_not_let_a_store_error_escape_and_crash_a_poller():
+    """SCP-C-034: a StoreError never escapes tick(). Although it is a BaseException (so the
+    engine can't swallow it), tick() catches it internally and returns, so an idiomatic
+    supervisor loop is not killed by a transient store outage — the event stays queued for the
+    next poll, no attempt burned, nothing dead-lettered."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+
+    def boom(*a, **k):
+        raise StoreError("disk I/O error")
+    store.peek_one_due = boom
+
+    n = rt.tick()  # must return, not raise (not even a BaseException)
+    assert n == 0
     assert store.dead_letters() == []
     store.close()
 
@@ -409,10 +427,7 @@ def test_durable_cascade_send_store_failure_is_infra_not_poison():
     store.enqueue = flaky_enqueue
 
     for _ in range(2):
-        try:
-            rt.tick()
-        except StoreError:
-            pass  # cascade store failure propagates (infra), retried forever
+        rt.tick()  # cascade store failure rolls back atomically; tick does not raise (SCP-C-034)
         assert "idle" in rt.load("s1").configuration, "delivery rolled back, not advanced"
         row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
         assert row is not None and row["attempts"] == 0, "an infra failure burns no attempt"

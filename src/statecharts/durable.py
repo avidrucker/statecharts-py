@@ -44,10 +44,12 @@ authority on its own failures: :class:`SqliteStore` wraps every ``sqlite3.Error`
 DB operations in a :class:`StoreError`.
 
 * A **store/infrastructure** failure — any :class:`StoreError` (disk-full / db-locked / I/O),
-  raised anywhere, including a cascade ``<send>`` inside ``process_event`` — is *not* poison: it
-  propagates out of :meth:`DurableRuntime.tick` and rolls back, so a healthy event caught in an
-  outage is retried indefinitely and never dead-lettered, and the cascade commits atomically
-  with the event or not at all (SCP-C-013 / SCP-C-019 / SCP-C-030).
+  raised anywhere, including a transaction boundary or a cascade ``<send>`` inside
+  ``process_event`` — is *not* poison: the event is rolled back and left queued (no attempt
+  burned), the current :meth:`DurableRuntime.tick` stops early with a warning, and the caller's
+  next poll retries it. Infra is retried indefinitely, never dead-lettered, and never raised out
+  of ``tick`` — so a transient outage does not kill an idiomatic polling loop (SCP-C-013 /
+  SCP-C-030 / SCP-C-032 / SCP-C-033 / SCP-C-034).
 * Any **other** ``Exception`` — chart logic failing, an unserializable working memory
   (``json.dumps`` ``TypeError``), an undecodable session blob or event payload, an event to an
   unknown session, or a handler's *own* bare ``sqlite3.Error`` (which did not come through this
@@ -257,38 +259,6 @@ class SqliteStore:
     def close(self) -> None:
         self.conn.close()
 
-    @contextmanager
-    def atomic(self):
-        """A write transaction that batches the otherwise per-call commits of
-        ``save_session`` / ``enqueue`` / ``cancel`` / ``defer`` into one unit, so a
-        crash mid-batch rolls the whole thing back. This is what makes delivery atomic:
-        claiming a timer, persisting the resulting working memory, and any cascade
-        ``<send>`` it enqueues all commit together, or not at all (bug #21). Nesting is
-        depth-counted — only the outermost block begins and commits/rolls back."""
-        outer = self._depth == 0
-        if outer:
-            self.conn.execute("BEGIN IMMEDIATE")
-        self._depth += 1
-        try:
-            yield
-        except BaseException:
-            if outer:
-                self.conn.rollback()
-            raise
-        else:
-            if outer:
-                self.conn.commit()
-        finally:
-            # Always restore depth, even if commit/rollback raised; `outer` (captured at
-            # entry) — not a re-read of _depth — decides who commits, so the count can't
-            # drift on nested or failing blocks.
-            self._depth -= 1
-
-    def _commit(self) -> None:
-        """Commit now, unless we're inside an ``atomic()`` block (then defer to it)."""
-        if self._depth == 0:
-            self.conn.commit()
-
     def _exec(self, sql: str, params: tuple = ()):
         """Run a data statement, translating the store's own ``sqlite3.Error`` into
         :class:`StoreError`. This is what lets :meth:`DurableRuntime.tick` tell an
@@ -300,23 +270,71 @@ class SqliteStore:
         except sqlite3.Error as exc:
             raise StoreError(str(exc)) from exc
 
+    def _txn(self, fn) -> None:
+        """Run a transaction-control call (``conn.commit`` / ``conn.rollback``), translating a
+        ``sqlite3.Error`` into :class:`StoreError` so a failure at a transaction *boundary* is
+        classified as infrastructure like every other store op (SCP-C-032/033)."""
+        try:
+            fn()
+        except sqlite3.Error as exc:
+            raise StoreError(str(exc)) from exc
+
+    @contextmanager
+    def atomic(self):
+        """A write transaction that batches the otherwise per-call commits of
+        ``save_session`` / ``enqueue`` / ``cancel`` / ``defer`` into one unit, so a
+        crash mid-batch rolls the whole thing back. This is what makes delivery atomic:
+        claiming a timer, persisting the resulting working memory, and any cascade
+        ``<send>`` it enqueues all commit together, or not at all (bug #21). Nesting is
+        depth-counted — only the outermost block begins and commits/rolls back. ``BEGIN`` /
+        ``commit`` / ``rollback`` go through the ``StoreError``-translating helpers, so a
+        transaction-boundary failure (e.g. ``BEGIN IMMEDIATE`` losing the write-lock race) is
+        infrastructure, not a raw ``sqlite3.Error`` (SCP-C-033)."""
+        outer = self._depth == 0
+        if outer:
+            self._exec("BEGIN IMMEDIATE")
+        self._depth += 1
+        try:
+            yield
+        except BaseException:
+            if outer:
+                self._txn(self.conn.rollback)
+            raise
+        else:
+            if outer:
+                self._txn(self.conn.commit)
+        finally:
+            # Always restore depth, even if commit/rollback raised; `outer` (captured at
+            # entry) — not a re-read of _depth — decides who commits, so the count can't
+            # drift on nested or failing blocks.
+            self._depth -= 1
+
+    def _commit(self) -> None:
+        """Commit now, unless we're inside an ``atomic()`` block (then defer to it)."""
+        if self._depth == 0:
+            self._txn(self.conn.commit)
+
     @contextmanager
     def savepoint(self):
         """A nested rollback point *inside* an ``atomic()`` block. On error it undoes only
         this block's writes (not the whole transaction), so the caller can then commit
         compensating changes. Used to discard a failed delivery's working-memory write
-        while still recording the attempt / dead-lettering it (#24)."""
+        while still recording the attempt / dead-lettering it (#24). All SAVEPOINT/ROLLBACK/
+        RELEASE go through ``_exec`` so a failure at the savepoint boundary is a
+        :class:`StoreError` (infrastructure), not misclassified as poison (SCP-C-032)."""
         name = f"sp{self._sp}"
+        # `SAVEPOINT` runs *before* the counter is bumped, so if it raises the counter does not
+        # leak (SCP-C-036); it is only incremented once the savepoint actually opened.
+        self._exec(f"SAVEPOINT {name}")
         self._sp += 1
-        self.conn.execute(f"SAVEPOINT {name}")
         try:
             yield
         except BaseException:
-            self.conn.execute(f"ROLLBACK TO {name}")
-            self.conn.execute(f"RELEASE {name}")
+            self._exec(f"ROLLBACK TO {name}")
+            self._exec(f"RELEASE {name}")
             raise
         else:
-            self.conn.execute(f"RELEASE {name}")
+            self._exec(f"RELEASE {name}")
         finally:
             self._sp -= 1
 
@@ -520,57 +538,74 @@ class DurableRuntime:
     def tick(self, now: Optional[float] = None, max_steps: int = 10_000) -> int:
         """Deliver every event that is due at ``now`` (default: the clock), draining
         cascades (a delivered event may enqueue more due-now events). Returns the
-        number of events delivered."""
+        number of events delivered.
+
+        Delivery failures are classified by AUTHORITY, not by exception type (a handler can
+        raise the same types the store does):
+
+        * :class:`StoreError` — our DB failed to read/write, *anywhere* (a transaction boundary,
+          a persist, or a cascade ``<send>``) — is infrastructure: the event is rolled back and
+          left queued (no attempt burned), this ``tick`` stops early and logs, and the caller's
+          next poll retries it. Infra is retried indefinitely and **never** raises out of
+          ``tick`` (so an idiomatic ``while True: try: tick() except Exception`` poller is not
+          killed by a transient outage — SCP-C-034) and never dead-lettered (SCP-C-013).
+        * any other ``Exception`` — chart logic, unserializable WM, undecodable session or
+          payload, unknown session, or a handler's *own* bare sqlite error — is poison: back
+          off, then dead-letter past the cap (#24 / SCP-C-019/027/028/029).
+        * ``BaseException`` — a crash: propagate, roll back, no attempt burned (bug #21).
+
+        (Cascade ``<send>`` failures that are *not* store failures — e.g. an unserializable send
+        payload — follow the engine's ordinary executable-content error semantics: they become
+        ``error.execution`` for the chart to handle, like any other bad executable content.)"""
         delivered = 0
         for _ in range(max_steps):
             t = self.store.clock.now() if now is None else now
-            # Lock-free pre-check: don't take the write lock (BEGIN IMMEDIATE) merely to find the
-            # queue idle — that would serialize all pollers on an empty queue (SCP-C-025). It
-            # costs one extra indexed read when work IS present (SCP-C-031, an accepted tradeoff
-            # against the idle-lock contention it removes).
-            if self.store.peek_one_due(t) is None:
-                break
-            # One transaction PER EVENT. Delivery failures are classified by AUTHORITY, not by
-            # exception type (a handler can raise the same types the store does):
-            #   * StoreError — our DB failed to read/write, anywhere incl. a cascade <send> — is
-            #     infrastructure: propagate, roll back, retry indefinitely, no attempt burned
-            #     (bug #21 / SCP-C-013 / SCP-C-030).
-            #   * any other Exception — chart logic, unserializable WM, undecodable session or
-            #     payload, unknown session, or a handler's own bare sqlite error — is poison:
-            #     back off, then dead-letter past the cap (#24 / SCP-C-019/027/028/029).
-            #   * BaseException — a crash: propagate, roll back, no attempt burned (bug #21).
-            with self.store.atomic():
-                row = self.store.peek_one_due(t)
-                if row is None:
+            try:
+                # Lock-free pre-check: don't take the write lock (BEGIN IMMEDIATE) merely to find
+                # the queue idle — that would serialize all pollers on an empty queue
+                # (SCP-C-025). Costs one extra indexed read when work IS present (SCP-C-031,
+                # accepted vs the idle-lock contention it removes).
+                if self.store.peek_one_due(t) is None:
                     break
-                timer_id = row["id"]
-                session_id = row["session_id"]
+                with self.store.atomic():  # one transaction PER EVENT
+                    row = self.store.peek_one_due(t)
+                    if row is None:
+                        break
+                    timer_id = row["id"]
+                    session_id = row["session_id"]
 
-                # Decode the event payload; a corrupt payload can never succeed, so it is
-                # dead-lettered immediately rather than wedging the queue (SCP-C-002).
-                try:
-                    event = event_from_jsonable(json.loads(row["event"]))
-                except Exception as exc:  # noqa: BLE001 — corrupt/undecodable payload
-                    self.store.dead_letter(row, f"undecodable event: {exc!r}")
-                    logger.warning(
-                        "durable: dead-lettered undecodable event for session %r (id=%s): %s",
-                        session_id, timer_id, exc,
-                    )
-                    continue
+                    # Decode the event payload; a corrupt payload can never succeed, so it is
+                    # dead-lettered immediately rather than wedging the queue (SCP-C-002).
+                    try:
+                        event = event_from_jsonable(json.loads(row["event"]))
+                    except Exception as exc:  # noqa: BLE001 — corrupt/undecodable payload
+                        self.store.dead_letter(row, f"undecodable event: {exc!r}")
+                        logger.warning(
+                            "durable: dead-lettered undecodable event for session %r (id=%s): %s",
+                            session_id, timer_id, exc,
+                        )
+                        continue
 
-                try:
-                    with self.store.savepoint():
-                        status = self._deliver(session_id, event)
-                        self.store.delete_timer(timer_id)
-                except StoreError:
-                    raise  # infrastructure: roll back and retry indefinitely, no attempt burned
-                except Exception as exc:  # noqa: BLE001 — poison (handler / data / unknown session)
-                    self._park_or_backoff(row, session_id, t, exc)
-                    continue
-                if status == "dropped":
-                    logger.debug("durable: dropped event for already-stopped session %r", session_id)
-                else:
-                    delivered += 1
+                    try:
+                        with self.store.savepoint():
+                            status = self._deliver(session_id, event)
+                            self.store.delete_timer(timer_id)
+                    except StoreError:
+                        raise  # infrastructure: bubble to the handler below (rolls back atomic())
+                    except Exception as exc:  # noqa: BLE001 — poison (handler / data / unknown)
+                        self._park_or_backoff(row, session_id, t, exc)
+                        continue
+                    if status == "dropped":
+                        logger.debug("durable: dropped event for stopped session %r", session_id)
+                    else:
+                        delivered += 1
+            except StoreError as exc:
+                # Infrastructure failure anywhere in this event's transaction: atomic() has
+                # rolled it back, so the event is still queued with no attempt burned. Stop this
+                # tick and let the caller re-poll — the store is (transiently) unavailable, so
+                # the next event would fail too. Never propagates, never dead-letters.
+                logger.warning("durable: store unavailable, will retry on the next tick: %s", exc)
+                break
         return delivered
 
     def _park_or_backoff(self, row, session_id: str, t: float, exc: Exception) -> None:
