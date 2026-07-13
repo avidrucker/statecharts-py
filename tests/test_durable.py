@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 
 from statecharts import (
-    ChartRegistry, DurableRuntime, SqliteStore, ManualClock,
+    ChartRegistry, DurableRuntime, SqliteStore, StoreError, ManualClock,
     statechart, state, final, on, on_entry, send_after,
 )
 
@@ -160,12 +160,12 @@ def test_durable_one_failing_event_does_not_revert_a_co_due_sibling():
     rt.enqueue("good", "go")     # enqueued first -> claimed/delivered first
     rt.enqueue("poison", "go")
 
-    real = rt._run
-    def run(rec, session_id, event):
+    real = rt._deliver
+    def deliver(session_id, event):
         if session_id == "poison":
             raise RuntimeError("simulated delivery failure")
-        return real(rec, session_id, event)
-    rt._run = run
+        return real(session_id, event)
+    rt._deliver = deliver
 
     # A delivery error is caught per-event (not propagated), so one poison event can't
     # abort the tick — tick() returns normally (SCP-C-008: assert this directly rather than
@@ -195,12 +195,12 @@ def test_durable_poison_oldest_does_not_block_newer_event():
     rt.enqueue("poison", "go")   # enqueued first -> OLDEST due
     rt.enqueue("good", "go")
 
-    real = rt._run
-    def run(rec, session_id, event):
+    real = rt._deliver
+    def deliver(session_id, event):
         if session_id == "poison":
             raise RuntimeError("poison")
-        return real(rec, session_id, event)
-    rt._run = run
+        return real(session_id, event)
+    rt._deliver = deliver
 
     rt.tick()  # must NOT wedge on the oldest (poison) event
     assert "b" in rt.load("good").configuration, rt.load("good").configuration
@@ -217,7 +217,7 @@ def test_durable_event_dead_lettered_after_cap():
     rt = DurableRuntime(store, reg)
     rt.start("c", "s1")
     rt.enqueue("s1", "go")
-    rt._run = lambda rec, sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
 
     for _ in range(5):
         store.clock.advance(10_000.0)  # clear any backoff so the timer is due again
@@ -242,7 +242,7 @@ def test_durable_failed_delivery_is_backed_off_to_the_future():
     rt = DurableRuntime(store, reg)
     rt.start("c", "s1")
     rt.enqueue("s1", "go")
-    rt._run = lambda rec, sid, ev: (_ for _ in ()).throw(RuntimeError("down for now"))
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down for now"))
 
     t0 = store.clock.now()
     rt.tick()  # one failed attempt at t0
@@ -293,7 +293,7 @@ def test_durable_under_cap_failure_is_logged():
     rt = DurableRuntime(store, reg)
     rt.start("c", "s1")
     rt.enqueue("s1", "go")
-    rt._run = lambda rec, sid, ev: (_ for _ in ()).throw(RuntimeError("transient blip"))
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("transient blip"))
 
     records = []
     handler = logging.Handler()
@@ -321,9 +321,9 @@ def test_durable_baseexception_propagates_without_burning_an_attempt():
     rt.start("c", "s1")
     rt.enqueue("s1", "go")
 
-    def crash(rec, sid, ev):
+    def crash(sid, ev):
         raise KeyboardInterrupt("operator hit Ctrl-C mid-delivery")
-    rt._run = crash
+    rt._deliver = crash
 
     raised = False
     try:
@@ -340,10 +340,10 @@ def test_durable_baseexception_propagates_without_burning_an_attempt():
 
 
 def test_durable_store_error_retries_forever_never_dead_letters():
-    """SCP-C-013 / SCP-Q-002: a store/infrastructure error (sqlite3.OperationalError from the
-    persistence layer — disk full / db locked / I/O) is NOT the event's fault. It must be
-    treated like a crash: propagate, roll back, burn no attempt, and be retried indefinitely —
-    never counted toward the poison cap and never dead-lettered."""
+    """SCP-C-013 / SCP-Q-002: a store/infrastructure error (StoreError from the persistence
+    layer — disk full / db locked / I/O) is NOT the event's fault. It must be treated like a
+    crash: propagate, roll back, burn no attempt, and be retried indefinitely — never counted
+    toward the poison cap and never dead-lettered."""
     store = SqliteStore(":memory:", clock=ManualClock())
     reg = ChartRegistry().register("c", _poison_chart())
     rt = DurableRuntime(store, reg)
@@ -355,14 +355,14 @@ def test_durable_store_error_retries_forever_never_dead_letters():
     def flaky_save(*a, **k):
         if outage["n"] > 0:
             outage["n"] -= 1
-            raise sqlite3.OperationalError("database is locked")
+            raise StoreError("database is locked")  # what SqliteStore raises on infra failure
         return real_save(*a, **k)
     store.save_session = flaky_save
 
     for _ in range(3):
         try:
             rt.tick()
-        except sqlite3.OperationalError:
+        except StoreError:
             pass  # infra error propagates (retry indefinitely), like a crash
         row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
         assert row is not None, "healthy event survives the outage"
@@ -372,6 +372,54 @@ def test_durable_store_error_retries_forever_never_dead_letters():
     rt.tick()  # DB recovered -> delivered normally
     assert "b" in rt.load("s1").configuration, rt.load("s1").configuration
     assert store.dead_letters() == []
+    store.close()
+
+
+def test_store_exec_wraps_sqlite_error_as_store_error():
+    """SCP-C-030 plumbing: SqliteStore surfaces its own DB failures as StoreError (not a bare
+    sqlite3.Error), which is what lets tick() classify infrastructure by authority."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    raised = None
+    try:
+        store._exec("SELECT * FROM no_such_table")
+    except StoreError as exc:
+        raised = exc
+    assert raised is not None, "a store DB failure must surface as StoreError"
+    assert isinstance(raised.__cause__, sqlite3.Error), "the original sqlite error is chained"
+    store.close()
+
+
+def test_durable_cascade_send_store_failure_is_infra_not_poison():
+    """SCP-C-030: when a store failure happens during a cascade <send> inside process_event
+    (entering `waiting` schedules a timer), it is our store failing — infrastructure — so it
+    propagates and is retried forever, never counted as poison / dead-lettered."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("flow", flow_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("flow", "s1")
+    rt.enqueue("s1", "begin")   # delivering this enters `waiting`, which cascades a <send>
+
+    real_enqueue = store.enqueue
+    outage = {"n": 2}
+    def flaky_enqueue(*a, **k):
+        if outage["n"] > 0:
+            outage["n"] -= 1
+            raise StoreError("database is locked")
+        return real_enqueue(*a, **k)
+    store.enqueue = flaky_enqueue
+
+    for _ in range(2):
+        try:
+            rt.tick()
+        except StoreError:
+            pass  # cascade store failure propagates (infra), retried forever
+        assert "idle" in rt.load("s1").configuration, "delivery rolled back, not advanced"
+        row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
+        assert row is not None and row["attempts"] == 0, "an infra failure burns no attempt"
+        assert store.dead_letters() == []
+
+    rt.tick()  # store recovered -> begin delivered, cascade timer scheduled
+    assert "waiting" in rt.load("s1").configuration, rt.load("s1").configuration
     store.close()
 
 
@@ -389,12 +437,12 @@ def test_durable_handler_sqlite_error_is_poison_not_a_queue_wedge():
     rt.enqueue("poison", "go")   # enqueued first -> oldest due
     rt.enqueue("good", "go")
 
-    real = rt._run
-    def run(rec, sid, ev):
+    real = rt._deliver
+    def deliver(sid, ev):
         if sid == "poison":
             raise sqlite3.OperationalError("handler's own resource is locked")
-        return real(rec, sid, ev)
-    rt._run = run
+        return real(sid, ev)
+    rt._deliver = deliver
 
     rt.tick()  # must NOT wedge on the poison (handler-sqlite) event
     assert "b" in rt.load("good").configuration, rt.load("good").configuration
@@ -413,7 +461,7 @@ def test_durable_backoff_advances_due_even_at_far_future_epoch():
     rt.BACKOFF_BASE_S = 0.0
     rt.start("c", "s1")
     rt.enqueue("s1", "go")
-    rt._run = lambda rec, sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
 
     rt.tick()  # a single fixed-clock tick
 
@@ -433,13 +481,78 @@ def test_durable_zero_backoff_base_still_spaces_retries_within_a_tick():
     rt.BACKOFF_BASE_S = 0.0
     rt.start("c", "s1")
     rt.enqueue("s1", "go")
-    rt._run = lambda rec, sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("always fails"))
 
     rt.tick()  # a single tick at a fixed clock
 
     row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
     assert row is not None and row["attempts"] == 1, "only one attempt burned per fixed-clock tick"
     assert store.dead_letters() == [], "zero backoff must not collapse all attempts into one tick"
+    store.close()
+
+
+def test_durable_unserializable_working_memory_is_poison_not_a_queue_wedge():
+    """SCP-C-027: a chart that writes a non-JSON value into the datamodel makes save_session's
+    json.dumps raise — a data/handler fault, so it must be poison (backed off, dead-lettered
+    after the cap), not an infra-zone failure that wedges the queue. A healthy session behind it
+    must still be delivered."""
+    from statecharts import handle, ops
+    bad = statechart({"initial": "c"},
+        state({"id": "c"}, handle("boom", lambda env, data: [ops.assign("x", set([1, 2, 3]))])))
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("bad", bad).register("good", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("bad", "b1")
+    rt.start("good", "g1")
+    rt.enqueue("b1", "boom")   # enqueued first -> oldest due
+    rt.enqueue("g1", "go")
+
+    rt.tick()  # the unserializable WM must NOT wedge the queue
+
+    assert "b" in rt.load("g1").configuration, "healthy session delivered past the bad one"
+    row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("b1",)).fetchone()
+    assert row is not None and row["attempts"] == 1, "unserializable WM is poison: backed off"
+    store.close()
+
+
+def test_durable_undecodable_session_blob_is_poison_not_a_queue_wedge():
+    """SCP-C-028: a session whose stored working-memory blob can't be decoded (corrupt / schema
+    drift) must be poison — dead-lettered after retries — not an infra-zone load failure that
+    re-raises every tick and wedges the whole queue behind it."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.start("c", "good")
+    store.conn.execute("UPDATE sessions SET wm=? WHERE session_id=?", ("{ not valid json", "s1"))
+    store.conn.commit()
+    rt.enqueue("s1", "go")     # oldest, but its session blob is corrupt
+    rt.enqueue("good", "go")
+
+    rt.tick()  # must not wedge on the undecodable session
+
+    assert "b" in rt.load("good").configuration, "healthy session delivered past the corrupt one"
+    row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("s1",)).fetchone()
+    assert row is not None and row["attempts"] == 1, "undecodable session blob is poison: backed off"
+    store.close()
+
+
+def test_durable_event_to_unknown_session_is_traced_not_silently_dropped():
+    """SCP-C-029: an event enqueued to a session that was never started (typo / enqueued before
+    start) must not be silently deleted and counted as delivered. It is retried (a late start
+    could make it deliverable) and, if the session stays unknown, dead-lettered — a queryable
+    trace, not a silent drop."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.enqueue("ghost", "go")   # never started
+
+    for _ in range(5):
+        store.clock.advance(10_000.0)
+        rt.tick()
+
+    dl = store.dead_letters()
+    assert len(dl) == 1 and dl[0]["session_id"] == "ghost", dl
     store.close()
 
 
