@@ -25,11 +25,14 @@ isolated — one failing event never reverts another's). The multi-worker Postgr
 uses a lease/visibility-timeout for **at-least-once** delivery (which then requires
 idempotent handlers) — see ``docs/design/postgres-durability.md``.
 
-**Per-session ordering under failure is not guaranteed.** Events are delivered oldest-due
-first, but when a session's event fails and is backed off, that session's *later* events are
-not held behind it — they may be delivered while it waits to retry. This is the deliberate #24
-tradeoff (isolate other sessions rather than block the whole queue on one). Strict per-session
-FIFO under failure is deferred to its own ticket (#26 — a session-level retry gate).
+**Per-session FIFO holds even under failure (#26).** Events are delivered oldest-due first,
+and when a session's head event fails it is retried with a spaced backoff — but instead of
+pushing that one timer's ``due`` (which would let a later sibling overtake it), the whole
+*session* is gated until its retry time (a row in the ``session_gates`` table). So a session's
+later events wait behind a failing earlier one, in strict ``(due, id)`` order, while **other**
+sessions keep delivering (no cross-session head-of-line blocking — the #24 isolation is kept).
+An event is dead-lettered after the cap, which clears the gate so the session's remaining
+events proceed.
 
 **"Exactly once" covers working memory, not external side effects.** The atomicity above is
 about the persisted state (working memory + timers). If a guard/action performs an *external*
@@ -53,8 +56,9 @@ DB operations in a :class:`StoreError`.
 * Any **other** ``Exception`` — chart logic failing, an unserializable working memory
   (``json.dumps`` ``TypeError``), an undecodable session blob or event payload, an event to an
   unknown session, or a handler's *own* bare ``sqlite3.Error`` (which did not come through this
-  store) — is *poison*: the attempt count is incremented and ``due`` pushed into the future
-  (exponential **backoff**), a warning is logged on *every* attempt, and after
+  store) — is *poison*: the attempt count is incremented and the whole *session* is gated for an
+  exponential **backoff** (a ``session_gates`` row; the timer keeps its original ``due`` so
+  per-session order is preserved — #26), a warning is logged on *every* attempt, and after
   ``DurableRuntime.DEAD_LETTER_CAP`` (default 5) attempts the event is moved to the
   ``dead_letters`` table — never silently dropped. An undecodable event payload is dead-lettered
   at once (it can never succeed). An event to a stopped session is dropped (its events are moot).
@@ -210,6 +214,11 @@ CREATE TABLE IF NOT EXISTS timers (
 );
 CREATE INDEX IF NOT EXISTS timers_due ON timers(due);
 CREATE INDEX IF NOT EXISTS timers_session ON timers(session_id);
+CREATE TABLE IF NOT EXISTS session_gates (
+    session_id TEXT PRIMARY KEY,
+    retry_at   REAL NOT NULL,
+    head_id    INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dead_letters (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -246,7 +255,8 @@ class SqliteStore:
         # missing and both ALTER. With busy_timeout set above, the loser's ALTER blocks until
         # the winner commits and then fails with "duplicate column name" (not "database is
         # locked", SCP-C-022); either way, tolerate the error once the column is present rather
-        # than crashing in __init__ (SCP-C-016).
+        # than crashing in __init__ (SCP-C-016). The #26 retry gate lives in its own
+        # `session_gates` table (created by the schema above), so it needs no column migration.
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(timers)")}
         if "attempts" not in cols:
             try:
@@ -315,8 +325,9 @@ class SqliteStore:
     @contextmanager
     def atomic(self):
         """A write transaction that batches the otherwise per-call commits of
-        ``save_session`` / ``enqueue`` / ``cancel`` / ``defer`` into one unit, so a
-        crash mid-batch rolls the whole thing back. This is what makes delivery atomic:
+        ``save_session`` / ``enqueue`` / ``cancel`` / ``bump_attempts`` / ``gate_session`` /
+        ``clear_gate`` into one unit, so a crash mid-batch rolls the whole thing back. This is
+        what makes delivery atomic:
         claiming a timer, persisting the resulting working memory, and any cascade
         ``<send>`` it enqueues all commit together, or not at all (bug #21). Nesting is
         depth-counted — only the outermost block begins and commits/rolls back. ``BEGIN`` /
@@ -420,44 +431,125 @@ class SqliteStore:
         self._commit()
 
     def cancel(self, session_id: str, sendid: str) -> None:
+        self._exec("DELETE FROM timers WHERE session_id=? AND sendid=?", (session_id, sendid))
+        # Clear the gate only if the specific timer that set it (``head_id``) is now gone — e.g.
+        # we just cancelled it. Keying on the failing timer's id, not a re-derived (due,id)-min
+        # head, keeps an UNRELATED cancel — even of an event that sorts ahead of the head under
+        # clock skew — from wiping a still-failing head's backoff and dead-lettering it early
+        # (#26). A no-op when nothing was gated or the gated head survives.
         self._exec(
-            "DELETE FROM timers WHERE session_id=? AND sendid=?", (session_id, sendid)
+            "DELETE FROM session_gates WHERE session_id=? AND NOT EXISTS "
+            "(SELECT 1 FROM timers WHERE id = session_gates.head_id)",
+            (session_id,),
         )
         self._commit()
 
     def next_due(self) -> Optional[float]:
+        """The earliest time any timer becomes *deliverable* — the min over timers of
+        ``max(due, its session's retry_at)`` — or ``None`` if the queue is empty. Gate-aware
+        (#26): a failing session's head keeps its past ``due``, but it can't be delivered until
+        the gate's ``retry_at``, so a poller that sleeps until ``next_due()`` waits out the
+        backoff instead of busy-spinning on a past due while the session is gated.
+
+        Fast path: the gate-aware full scan runs only while some session is *actively* backing
+        off (``retry_at > now``); otherwise this is a plain ``MIN(due)`` answered from the
+        ``timers_due`` index. Only an active gate can push a timer's deliverable time past its
+        ``due``, so an expired-but-not-yet-cleared gate row (lingering through a post-outage
+        drain) doesn't force the scan."""
         row = self._query_one("SELECT MIN(due) AS d FROM timers")
-        return row["d"] if row and row["d"] is not None else None
+        earliest = row["d"] if row else None
+        if earliest is None:
+            return None
+        now = self.clock.now()
+        if self._query_one(
+            "SELECT 1 FROM session_gates WHERE retry_at > ? LIMIT 1", (now,)
+        ) is None:
+            return earliest  # no active backoff -> MIN(due) is exact and index-served
+        # Deliverable time per timer = max(due, retry_at) if gated, else due. COALESCE the gate
+        # term to `t.due` (not 0) so an un-gated negative-epoch timer isn't lifted to 0.
+        row = self._query_one(
+            "SELECT MIN(MAX(t.due, COALESCE(g.retry_at, t.due))) AS d FROM timers t "
+            "LEFT JOIN session_gates g ON g.session_id = t.session_id"
+        )
+        return row["d"] if row and row["d"] is not None else earliest
 
     def peek_one_due(self, now: float) -> Optional[sqlite3.Row]:
-        """The single oldest due timer (``due <= now``), **without** deleting it. Returns a
-        row (``id, session_id, due, event, attempts``) or ``None``. Delivery
-        (:meth:`DurableRuntime.tick`) peeks, delivers, and deletes on success in one
+        """The single oldest due, **non-gated** timer (``due <= now``), without deleting it.
+        Returns a row (``id, session_id, due, event, attempts``) or ``None``.
+
+        Delivery (:meth:`DurableRuntime.tick`) peeks, delivers, and deletes on success in one
         transaction — so a failed delivery can be recorded (backoff / dead-letter) instead of
-        silently vanishing. A failed event is rescheduled into the future (:meth:`defer`), so
-        it is no longer ``due`` this tick and can't be re-peeked — no exclusion set needed."""
+        silently vanishing.
+
+        Per-session FIFO under failure (#26): a session whose head event failed is *gated* — a
+        row in ``session_gates`` holds its future ``retry_at`` — and **all** its timers are
+        skipped until then (``g.retry_at IS NULL OR g.retry_at <= now``, where ``NULL`` is the
+        un-gated case; not a ``COALESCE``-to-0 sentinel, which would mis-gate a negative epoch).
+        Because the gate blocks the
+        whole session rather than rewriting any timer's ``due``, natural ``(due, id)`` order is
+        preserved: a later sibling can never overtake the earlier event being retried. The gate
+        is keyed by ``session_id`` in its own table (not a column on ``sessions``), so it applies
+        even to a *sessionless* timer — an event enqueued before its session was started — giving
+        that orphan the same one-attempt-per-tick spaced retry, and a ``LEFT JOIN`` keeps
+        un-gated timers (the common case) reachable.
+
+        Cost note: the ``session_gates`` PRIMARY KEY indexes the join, but the query still scans
+        ``timers`` in ``(due, id)`` order and skips gated rows, so if many earlier-due sessions
+        are gated at once (a widespread transient outage) a drain walks past them on each call.
+        That degraded-mode scan is accepted for the single-node SQLite backend; the multi-worker
+        Postgres port claims work with ``FOR UPDATE SKIP LOCKED`` instead (see the design doc)."""
+        # `g.retry_at IS NULL` (not a COALESCE-to-0 sentinel) marks an un-gated timer, so an
+        # ungated event stays deliverable even at a negative clock epoch — 0 is a real point on
+        # the timeline, not a safe "no gate" floor (round-4 review).
         return self._query_one(
-            "SELECT id, session_id, due, event, attempts FROM timers "
-            "WHERE due<=? ORDER BY due, id LIMIT 1",
-            (now,),
+            "SELECT t.id, t.session_id, t.due, t.event, t.attempts FROM timers t "
+            "LEFT JOIN session_gates g ON g.session_id = t.session_id "
+            "WHERE t.due<=? AND (g.retry_at IS NULL OR g.retry_at<=?) "
+            "ORDER BY t.due, t.id LIMIT 1",
+            (now, now),
         )
 
     def delete_timer(self, timer_id: int) -> None:
         self._exec("DELETE FROM timers WHERE id=?", (timer_id,))
         self._commit()
 
-    def defer(self, timer_id: int, new_due: float) -> None:
-        """Record a failed delivery attempt and reschedule the timer to ``new_due`` (backoff),
-        atomically. Because the event is no longer due until ``new_due`` it can't
-        head-of-line-block newer events, and it gets a real spaced retry window (#24, SCP-C-001).
+    def bump_attempts(self, timer_id: int) -> None:
+        """Record one failed delivery attempt on a timer **without** touching its ``due`` (#26).
 
-        Note: this does not hold back the *same* session's later events, so under a delivery
-        failure a session's events may be delivered out of order (the deliberate #24 tradeoff —
-        isolate other sessions rather than block on one). Strict per-session FIFO under failure
-        is tracked separately (see the durable module docstring)."""
+        The failed event keeps its original schedule slot; the spaced retry is enforced by
+        gating its *session* (:meth:`gate_session`) rather than by pushing this timer's ``due``
+        into the future. Not rewriting ``due`` is what preserves per-session ``(due, id)`` order
+        under failure: an earlier due-mutation approach (which advanced this timer's ``due``) let
+        a later sibling scheduled inside the backoff window overtake it, and collapsed co-due
+        siblings so the ``id`` tiebreak could reorder them — both reverted for this gate (#26)."""
+        self._exec("UPDATE timers SET attempts=attempts+1 WHERE id=?", (timer_id,))
+        self._commit()
+
+    def gate_session(self, session_id: str, retry_at: float, head_id: int) -> None:
+        """Hold a session's whole mailbox until ``retry_at`` (#26). Set when the session's head
+        event (timer ``head_id``) fails: :meth:`peek_one_due` then skips every timer of this
+        session until the clock passes ``retry_at``, so its later events wait behind the failing
+        earlier one (strict per-session FIFO) while other sessions keep delivering. Keyed by
+        ``session_id`` in ``session_gates``, so it gates even a *sessionless* timer (an event
+        enqueued before its session was started) — giving that orphan a spaced one-attempt-per-
+        tick retry too. ``head_id`` records *which* timer the gate belongs to, so :meth:`cancel`
+        clears the gate only when that specific timer is removed — not on an unrelated cancel of
+        an event that merely sorts ahead of it under clock skew."""
         self._exec(
-            "UPDATE timers SET attempts=attempts+1, due=? WHERE id=?", (new_due, timer_id)
+            "INSERT INTO session_gates(session_id, retry_at, head_id) VALUES(?,?,?) "
+            "ON CONFLICT(session_id) DO UPDATE SET retry_at=excluded.retry_at, "
+            "head_id=excluded.head_id",
+            (session_id, retry_at, head_id),
         )
+        self._commit()
+
+    def clear_gate(self, session_id: str) -> None:
+        """Release a session's retry gate (#26) — called once its gated head event leaves the
+        queue: successfully delivered, dead-lettered past the cap, or the head cancelled
+        (:meth:`cancel`). Note ``start()`` deliberately does *not* clear the gate — a restart
+        keeps pending timers, so a still-failing head (and its backoff) must survive. Idempotent:
+        a no-op when the session was never gated."""
+        self._exec("DELETE FROM session_gates WHERE session_id=?", (session_id,))
         self._commit()
 
     def dead_letter(self, row: sqlite3.Row, error: str) -> None:
@@ -553,6 +645,11 @@ class DurableRuntime:
         env = self._env(session_id, chart)
         wm = initialize(env, data)
         self.store.save_session(session_id, chart_name, wm)
+        # Note: a (re)start deliberately does NOT clear a retry gate. start() re-inits working
+        # memory but keeps pending timers, so a still-failing head event survives the restart —
+        # and its backoff must survive with it, or a restart would retry it back-to-back and
+        # dead-letter it early. A gate is only ever cleared when its head actually leaves the
+        # queue (delivered / dead-lettered / the head itself cancelled), so it is never stale (#26).
         return wm
 
     def enqueue(self, session_id: str, event, *, delay: int = 0) -> None:
@@ -615,8 +712,10 @@ class DurableRuntime:
             try:
                 # Lock-free pre-check: don't take the write lock (BEGIN IMMEDIATE) merely to find
                 # the queue idle — that would serialize all pollers on an empty queue
-                # (SCP-C-025). Costs one extra indexed read when work IS present (SCP-C-031,
-                # accepted vs the idle-lock contention it removes).
+                # (SCP-C-025). Costs one extra peek per delivered event when work IS present
+                # (SCP-C-031); since #26 that peek is a gated LEFT JOIN, so the per-event pre-
+                # check is a little dearer in the degraded many-sessions-gated mode — still
+                # accepted vs the idle-lock contention it removes.
                 if self.store.peek_one_due(t) is None:
                     break
                 status = None
@@ -632,6 +731,9 @@ class DurableRuntime:
                     try:
                         event = event_from_jsonable(json.loads(row["event"]))
                     except Exception as exc:  # noqa: BLE001 — corrupt/undecodable payload
+                        # No clear_gate here: an undecodable head is dead-lettered before it ever
+                        # reaches _deliver, so it can never have gated its session (a gate is only
+                        # set on a decodable event that failed in _deliver).
                         self.store.dead_letter(row, f"undecodable event: {exc!r}")
                         logger.warning(
                             "durable: dead-lettered undecodable event for session %r (id=%s): %s",
@@ -643,6 +745,12 @@ class DurableRuntime:
                         with self.store.savepoint():
                             status = self._deliver(session_id, event)
                             self.store.delete_timer(timer_id)
+                            # Release the per-session retry gate now this head event has landed.
+                            # Unconditional and idempotent (a no-op DELETE when the session was
+                            # never gated) — avoids coupling gate-release to the attempts counter,
+                            # which would silently break if a non-owner timer ever carried
+                            # attempts>0 (#26 round-4 review).
+                            self.store.clear_gate(session_id)
                     except StoreError:
                         raise  # infrastructure: bubble to the handler below (rolls back atomic())
                     except Exception as exc:  # noqa: BLE001 — poison (handler / data / unknown)
@@ -665,11 +773,17 @@ class DurableRuntime:
         return delivered
 
     def _park_or_backoff(self, row, session_id: str, t: float, exc: Exception) -> None:
-        """A handler (poison) failure: back the timer off for a spaced retry, or dead-letter it
-        once the attempt cap is reached (#24). Logs every attempt (SCP-C-007)."""
+        """A handler (poison) failure: gate the session for a spaced retry, or dead-letter the
+        event once the attempt cap is reached (#24 / #26). Logs every attempt (SCP-C-007).
+
+        The retry is spaced by gating the *session* until ``retry_at`` (#26), not by pushing the
+        failed timer's ``due`` — so the session's later events wait behind it (per-session FIFO)
+        and the timer keeps its schedule slot. On dead-letter the head event is removed, so the
+        gate is cleared and the session's remaining events proceed."""
         n = row["attempts"] + 1
         if n >= self.DEAD_LETTER_CAP:
             self.store.dead_letter(row, str(exc))
+            self.store.clear_gate(session_id)
             logger.warning(
                 "durable: dead-lettered event for session %r after %d attempts: %s",
                 session_id, n, exc,
@@ -677,13 +791,15 @@ class DurableRuntime:
         else:
             backoff = min(self.BACKOFF_BASE_S * (2 ** (n - 1)), self.BACKOFF_MAX_S)
             backoff = max(backoff, self.BACKOFF_MIN_S)
-            # Guarantee `due` strictly advances even at large float epochs where the backoff
-            # would round away, so a failed timer is never re-peeked within one tick (SCP-C-024).
-            new_due = max(t + backoff, math.nextafter(t, math.inf))
-            self.store.defer(row["id"], new_due)
+            # Guarantee the gate's retry_at strictly advances past `now` even at large float
+            # epochs where the backoff would round away, so a failed session is never re-peeked
+            # within one tick even with BACKOFF_BASE_S tuned to 0 (SCP-C-018 / SCP-C-024).
+            retry_at = max(t + backoff, math.nextafter(t, math.inf))
+            self.store.bump_attempts(row["id"])
+            self.store.gate_session(session_id, retry_at, row["id"])
             logger.warning(
                 "durable: delivery failed for session %r (attempt %d/%d); "
-                "retrying after %.3gs backoff: %s",
+                "gating session for %.3gs backoff: %s",
                 session_id, n, self.DEAD_LETTER_CAP, backoff, exc,
             )
 

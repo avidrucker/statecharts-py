@@ -233,10 +233,12 @@ def test_durable_event_dead_lettered_after_cap():
 
 
 def test_durable_failed_delivery_is_backed_off_to_the_future():
-    """SCP-C-001: a failed delivery must be rescheduled into the future (a real retry
-    window), not left immediately re-eligible. Without backoff a fixed-clock drain burns
-    every attempt back-to-back in microseconds; with backoff one tick records exactly one
-    attempt and the timer's next due time moves past `now`."""
+    """SCP-C-001 (mechanism updated for #26): a failed delivery must get a real spaced retry
+    window, not be left immediately re-eligible. #26 spaces the retry by gating the *session*
+    until a future `retry_at` (rather than pushing the timer's `due` — which would let a sibling
+    overtake it). So after one failure at a fixed clock the event is still live at its original
+    due time, but is no longer *deliverable* (its session is gated) and a fixed-clock drain burns
+    no further attempts."""
     store = SqliteStore(":memory:", clock=ManualClock())
     reg = ChartRegistry().register("c", _poison_chart())
     rt = DurableRuntime(store, reg)
@@ -247,11 +249,15 @@ def test_durable_failed_delivery_is_backed_off_to_the_future():
     t0 = store.clock.now()
     rt.tick()  # one failed attempt at t0
 
-    # The event is backed off: still live, but its next due time is in the future.
+    # The event is not lost, but it is gated: nothing is deliverable at the fixed clock, and
+    # the session's retry_at was pushed into the future (the spaced retry window).
     assert store.next_due() is not None, "event must not be lost"
-    assert store.next_due() > t0, "failed delivery must be rescheduled into the future"
+    assert store.peek_one_due(t0) is None, "the failed session is gated — not re-eligible at t0"
+    retry_at = store.conn.execute(
+        "SELECT retry_at FROM session_gates WHERE session_id=?", ("s1",)).fetchone()["retry_at"]
+    assert retry_at > t0, "the session's retry gate must be set into the future"
 
-    # A fixed-clock drain does NOT keep burning attempts — nothing is due yet.
+    # A fixed-clock drain does NOT keep burning attempts — the session is gated.
     rt.tick(); rt.tick(); rt.tick()
     row = store.conn.execute("SELECT attempts FROM timers").fetchone()
     assert row is not None and row["attempts"] == 1, "no back-to-back attempt burn at fixed clock"
@@ -695,6 +701,312 @@ def test_durable_event_to_unknown_session_is_traced_not_silently_dropped():
 
     dl = store.dead_letters()
     assert len(dl) == 1 and dl[0]["session_id"] == "ghost", dl
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# #26 — strict per-session FIFO under failure (session retry-gate)
+# ---------------------------------------------------------------------------
+
+
+def _ordered_chart():
+    """a --P--> b --Q--> c(final). Reaches the terminal state c ONLY if P is delivered
+    before Q. If Q arrives first (while in a) it is dropped (no handler), so a later P
+    lands in b and Q is gone — the session wedges in b. So 'config reaches c' is an exact
+    witness that the session's two events were delivered in schedule order."""
+    return statechart({"initial": "a"},
+        state({"id": "a"}, on("P", "b")),
+        state({"id": "b"}, on("Q", "c")),
+        final({"id": "c"}),
+    )
+
+
+def _fail_once(rt, event_name):
+    """Wrap rt._deliver so the first delivery of `event_name` raises (a transient failure),
+    and every later delivery (of any event) succeeds normally."""
+    real = rt._deliver
+    budget = {event_name: 1}
+    def deliver(session_id, event):
+        if budget.get(event.name, 0) > 0:
+            budget[event.name] -= 1
+            raise RuntimeError(f"transient failure delivering {event.name!r}")
+        return real(session_id, event)
+    rt._deliver = deliver
+
+
+def test_durable_same_session_later_event_waits_for_a_failing_earlier_one():
+    """#26 / SCP-C-021 sibling case: two co-due same-session events [P, Q] (P older). If P
+    transiently fails, Q must NOT be delivered before P succeeds — the session's order is
+    preserved under failure. Witness: the chart reaches terminal `c`, which is reachable only
+    if P is delivered before Q. RED on main (Q overtakes the backed-off P, so the session
+    wedges in `b`); GREEN once the session is gated behind its failing head."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _ordered_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "P")   # enqueued first -> oldest due (lowest id)
+    rt.enqueue("s1", "Q")   # co-due, queued behind P
+    _fail_once(rt, "P")
+
+    for _ in range(6):      # drain, clearing any retry backoff between ticks
+        store.clock.advance(10_000.0)
+        rt.tick()
+
+    assert "c" in rt.load("s1").configuration, (
+        "later same-session event must wait for the failing earlier one; "
+        f"got {sorted(rt.load('s1').configuration)}"
+    )
+    assert store.next_due() is None, "both events eventually drained"
+    store.close()
+
+
+def test_durable_sibling_inside_backoff_window_does_not_overtake():
+    """SCP-C-020: a same-session sibling scheduled strictly INSIDE the failing head's backoff
+    window must not overtake it. P (due now) transiently fails; Q is due 0.5s later — after P
+    but before P's ~1s backoff. Without a session gate, Q becomes deliverable while P is parked
+    and overtakes it (the exact due-mutation gap that was reverted). With the gate, P's whole
+    session is held until it succeeds, so schedule order holds and the chart reaches `c`."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _ordered_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "P")               # due at t0 (oldest)
+    rt.enqueue("s1", "Q", delay=500)    # due at t0+0.5s — inside P's ~1s backoff window
+    _fail_once(rt, "P")
+
+    store.clock.advance(0.0); rt.tick()   # t0: P fails, is gated/backed off
+    store.clock.advance(0.5); rt.tick()   # t0+0.5: Q is due but must not overtake P
+    for _ in range(6):                    # let the backoff expire; P retries, then Q
+        store.clock.advance(10_000.0)
+        rt.tick()
+
+    assert "c" in rt.load("s1").configuration, (
+        "a sibling due inside the backoff window must not overtake the failing head; "
+        f"got {sorted(rt.load('s1').configuration)}"
+    )
+    assert store.next_due() is None
+    store.close()
+
+
+def test_durable_due_order_beats_id_order_across_a_failure():
+    """SCP-C-021: same-session delivery order is (due, id) even under failure, and the `due`
+    key dominates the `id` tiebreak. Here Q is enqueued first (lower id) but scheduled LATER
+    (due t0+0.5); P is enqueued second (higher id) but due now. Schedule order is P then Q,
+    the reverse of id order. P transiently fails. The session must still deliver P before Q
+    (reaching `c`), proving the gate preserves (due, id) order and does not fall back to raw id
+    order. RED on main (P is parked, Q — lower id — is delivered early and dropped, wedging b)."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _ordered_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "Q", delay=500)    # id=1, but due LATER (t0+0.5)
+    rt.enqueue("s1", "P")               # id=2, but due NOW (t0) -> earliest by (due, id)
+    _fail_once(rt, "P")
+
+    store.clock.advance(0.0); rt.tick()   # t0: P (higher id, earlier due) fails, gated
+    store.clock.advance(0.5); rt.tick()   # t0+0.5: Q (lower id) due but must not jump ahead
+    for _ in range(6):
+        store.clock.advance(10_000.0)
+        rt.tick()
+
+    assert "c" in rt.load("s1").configuration, (
+        "delivery must follow (due, id) schedule order across a failure, not raw id order; "
+        f"got {sorted(rt.load('s1').configuration)}"
+    )
+    assert store.next_due() is None
+    store.close()
+
+
+def test_durable_unknown_session_event_gets_one_attempt_per_tick_not_all_at_once():
+    """#26 review Finding 1: an event to a not-yet-started (sessionless) session must still be
+    retried ONE attempt per fixed-clock tick — the retry gate must apply to sessionless timers
+    too. Otherwise a session started even one tick late can never catch an event enqueued before
+    it existed, because the orphan burns all DEAD_LETTER_CAP attempts back-to-back in one tick."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.enqueue("ghost", "go")   # never started -> UnknownSessionError (poison) on delivery
+
+    rt.tick()   # a single fixed-clock tick
+
+    row = store.conn.execute("SELECT attempts FROM timers WHERE session_id=?", ("ghost",)).fetchone()
+    assert row is not None, "the orphan event must survive one tick (not dead-lettered at once)"
+    assert row["attempts"] == 1, f"one attempt per fixed-clock tick, got {row and row['attempts']}"
+    assert store.dead_letters() == [], "must not burn all attempts back-to-back in a single tick"
+    store.close()
+
+
+def test_durable_unknown_session_event_is_delivered_by_a_late_start():
+    """#26 review Finding 1: the spaced retry must give a late start() a chance to deliver an
+    event enqueued before the session existed (the documented 'a late start may still deliver
+    it', SCP-C-029) — not dead-letter it inside the first tick."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.enqueue("late", "go")   # enqueued before the session is started
+
+    rt.tick()                  # attempt 1: unknown session, spaced-retried (not dead-lettered)
+    assert store.dead_letters() == [], "must not dead-letter a late-startable event in one tick"
+    rt.start("c", "late")      # the session starts (a little late)
+    store.clock.advance(10_000.0)
+    rt.tick()                  # now deliverable
+
+    assert "b" in rt.load("late").configuration, rt.load("late").configuration
+    assert store.dead_letters() == []
+    store.close()
+
+
+def test_durable_next_due_reflects_the_retry_gate_not_the_past_due():
+    """#26 review Finding 2: while a session is gated after a failure, next_due() must report the
+    future retry time — not the failing head's original (now past) due — so a poller that sleeps
+    until next_due() waits for the backoff instead of busy-spinning the whole window."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down"))
+
+    t0 = store.clock.now()
+    rt.tick()   # one failure -> session gated into the future
+
+    assert store.peek_one_due(t0) is None, "nothing is deliverable at t0 (the session is gated)"
+    nd = store.next_due()
+    assert nd is not None and nd > t0, f"next_due must reflect the gate's future retry time, got {nd}"
+    store.close()
+
+
+def test_durable_restart_preserves_a_failing_events_backoff():
+    """#26 review round 2, Finding 2: a (re)start must NOT discard the retry backoff of a
+    still-queued failing event. The failing head timer survives a restart (start() re-inits
+    working memory but keeps pending timers), so its gate must survive too — otherwise the event
+    is retried back-to-back after every restart and dead-lettered prematurely."""
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down"))
+    rt.tick()   # fail once -> gated, attempts=1
+
+    rt.start("c", "s1")   # restart at the fixed clock -> must NOT clear the backoff gate
+
+    # The failing event is still gated at the fixed clock: not re-attempted after the restart.
+    assert store.peek_one_due(store.clock.now()) is None, "restart must preserve the backoff gate"
+    rt.tick()  # fixed clock; still gated -> no new attempt burned
+    row = store.conn.execute("SELECT attempts FROM timers WHERE session_id='s1'").fetchone()
+    assert row is not None and row["attempts"] == 1, (
+        f"restart must not burn an extra attempt on a backed-off event; got {row and row['attempts']}")
+    assert store.dead_letters() == []
+    store.close()
+
+
+def test_durable_head_cancel_clears_the_retry_gate():
+    """#26: cancelling the gated *head* timer must clear the retry gate, so a subsequently-
+    enqueued event is not stranded behind a now-gone head."""
+    from statecharts import coerce_event
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    store.enqueue("s1", coerce_event("go"), store.clock.now(), sendid="h")  # the only/head timer
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down"))
+    rt.tick()   # head fails -> s1 gated
+    assert store.peek_one_due(store.clock.now()) is None, "precondition: s1 is gated"
+
+    store.cancel("s1", "h")   # cancel the gated HEAD -> must clear the gate
+    del rt._deliver           # restore the real delivery path
+
+    store.enqueue("s1", coerce_event("go"), store.clock.now())
+    rt.tick()   # fixed clock; delivers only if cancelling the head cleared the gate
+    assert "b" in rt.load("s1").configuration, rt.load("s1").configuration
+    store.close()
+
+
+def test_durable_unrelated_cancel_does_not_clear_a_failing_heads_gate():
+    """#26 review round 2, Finding 1: cancelling an UNRELATED timer (or a no-match sendid) must
+    NOT clear a still-failing head's backoff gate — otherwise repeated unrelated cancels retry
+    the head back-to-back and dead-letter it prematurely. Only cancelling the head clears it."""
+    from statecharts import coerce_event
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    store.enqueue("s1", coerce_event("go"), store.clock.now(), sendid="head")  # the failing head
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down"))
+    rt.tick()   # head fails -> gated, attempts=1
+
+    store.cancel("s1", "nonexistent-sendid")   # unrelated cancel: matches no timer
+    assert store.peek_one_due(store.clock.now()) is None, "an unrelated cancel must not un-gate the head"
+    rt.tick()   # fixed clock; head still gated -> no extra attempt
+    row = store.conn.execute("SELECT attempts FROM timers WHERE session_id='s1'").fetchone()
+    assert row is not None and row["attempts"] == 1, (
+        f"unrelated cancel must not accelerate the failing head; attempts={row and row['attempts']}")
+    assert store.dead_letters() == []
+    store.close()
+
+
+def test_durable_delivers_at_a_negative_clock_epoch():
+    """#26 review round 4, Finding 1: the gate filter must not use 0 as a no-gate sentinel — an
+    ungated timer must remain deliverable even when the clock reports a negative epoch (a
+    ManualClock simulation), which `COALESCE(retry_at,0) <= now` wrongly filtered out."""
+    store = SqliteStore(":memory:", clock=ManualClock(start=-10.0))
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    rt.enqueue("s1", "go")   # due at now = -10 (ungated)
+    n = rt.tick()
+    assert n == 1, "an ungated event must deliver at a negative clock epoch"
+    assert "b" in rt.load("s1").configuration, rt.load("s1").configuration
+    store.close()
+
+
+def test_durable_cancelling_a_non_head_sibling_keeps_the_gate():
+    """#26 review round 3, Finding 2 (coverage): cancelling a real NON-head sibling (a genuine
+    timer, not a no-match sendid) while the gated head still fails must leave the gate intact."""
+    from statecharts import coerce_event
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    store.enqueue("s1", coerce_event("go"), store.clock.now(), sendid="head")            # head
+    store.enqueue("s1", coerce_event("later"), store.clock.now() + 100, sendid="sib")    # sibling
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down"))
+    rt.tick()   # head fails -> gated
+
+    store.cancel("s1", "sib")   # cancel the NON-head sibling -> gate must remain
+    assert store.conn.execute(
+        "SELECT 1 FROM session_gates WHERE session_id='s1'").fetchone() is not None, \
+        "cancelling a non-head sibling must not clear the failing head's gate"
+    assert store.peek_one_due(store.clock.now()) is None, "head still gated"
+    store.close()
+
+
+def test_durable_cancelling_an_earlier_due_sibling_does_not_ungate_the_failing_head():
+    """#26 review round 3, Finding 1: the gate must be owned by the timer that failed, not
+    re-derived as the (due,id)-min head. If a newer event sorts AHEAD of the failing head (a
+    clock skew / backward clock adjustment can make due(new) < due(head)), cancelling that newer
+    event must NOT clear the still-failing head's gate."""
+    from statecharts import coerce_event
+    store = SqliteStore(":memory:", clock=ManualClock())
+    reg = ChartRegistry().register("c", _poison_chart())
+    rt = DurableRuntime(store, reg)
+    rt.start("c", "s1")
+    store.enqueue("s1", coerce_event("go"), store.clock.now(), sendid="head")   # head, due=0
+    rt._deliver = lambda sid, ev: (_ for _ in ()).throw(RuntimeError("down"))
+    rt.tick()   # head fails -> gated, attempts=1
+    head_id = store.conn.execute("SELECT id FROM timers WHERE session_id='s1'").fetchone()["id"]
+
+    # A newer event that (via clock skew) sorts AHEAD of the failing head.
+    store.enqueue("s1", coerce_event("later"), -5.0, sendid="skewed")
+    store.cancel("s1", "skewed")   # cancel the skewed sibling, NOT the failing head
+
+    assert store.conn.execute(
+        "SELECT 1 FROM session_gates WHERE session_id='s1'").fetchone() is not None, \
+        "cancelling an earlier-due sibling must not clear the failing head's gate"
+    assert store.peek_one_due(store.clock.now()) is None, "the failing head is still gated"
+    row = store.conn.execute("SELECT attempts FROM timers WHERE id=?", (head_id,)).fetchone()
+    assert row is not None and row["attempts"] == 1
     store.close()
 
 
