@@ -47,13 +47,17 @@ Higher-level layers:
   `assoc_alias`/`set_actor` ops and `resolve_actors`/`resolve_aliases` helpers. The
   path toward porting Fulcro-style statechart-driven apps to Python.
 - **Visualization** (`viz.py`) — `to_mermaid` and `to_dot` renderers.
-- **Durable sessions** (`durable.py`) — a SQLite-backed event queue + session store,
-  so a workflow can wait for hours/days **across process restarts**. Charts are
-  registered by name (`ChartRegistry`); only JSON-able working memory and pending
-  timers are persisted. `DurableRuntime.start`/`enqueue`/`tick` drive it. SQLite gives
-  durability + safe multi-process access on one machine; the same schema ports to
-  Postgres (`SELECT ... FOR UPDATE SKIP LOCKED`) for true multi-node distribution.
-  See `examples/05_durable_workflow.py` for a restart-survival demo.
+- **Durable sessions** (`durable.py` / `durable_postgres.py`) — a persistent event
+  queue + session store, so a workflow can wait for hours/days **across process
+  restarts**. Charts are registered by name (`ChartRegistry`); only JSON-able working
+  memory and pending timers are persisted. Two backends: `SqliteStore` +
+  `DurableRuntime` give single-host durability with **exactly-once** delivery, and
+  `PostgresStore` + `PostgresRuntime` (the optional `postgres` extra,
+  `pip install -e '.[postgres]'`) give multi-node **at-least-once** delivery via
+  `SELECT ... FOR UPDATE SKIP LOCKED` lease claiming. See
+  [`docs/guide/durability.md`](docs/guide/durability.md) for choosing a backend and the
+  at-least-once idempotency contract, and `examples/05_durable_workflow.py` for a
+  restart-survival demo.
 
 The scope from the original plan is now complete, including the durable event queue.
 
@@ -208,6 +212,7 @@ src/statecharts/
   aio.py             # AsyncSession: asyncio runtime (real-time delayed sends)
   store.py           # normalized store + actors/aliases (Fulcro-style app state)
   durable.py         # SQLite durable event queue + session store + DurableRuntime
+  durable_postgres.py # Postgres backend: PostgresStore + PostgresRuntime (SKIP LOCKED lease)
   viz.py             # to_mermaid / to_dot chart renderers
   scxml/loader.py    # SCXML XML -> element tree
 tests/

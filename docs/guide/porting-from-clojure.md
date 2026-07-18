@@ -64,7 +64,7 @@ The port keeps upstream's pluggable design. You swap an implementation by passin
 |---|---|---|---|
 | Data storage | `DataModel` | `LocalDataModel` (dict) | external / normalized store (`NormalizedDataModel`) |
 | Expression eval | `ExecutionModel` | `CallableExecutionModel` | a sandboxed / symbolic evaluator (see §4) |
-| Event delivery | `EventQueue` | `MemoryEventQueue` + `Clock` | durable / distributed queue (`SqliteEventQueue`) |
+| Event delivery | `EventQueue` | `MemoryEventQueue` + `Clock` | durable / distributed queue (`SqliteEventQueue`; Postgres for multi-node — see the [durability guide](durability.md)) |
 | Step interface | `algorithm.process_event` | — | (the engine itself) |
 
 ```python
