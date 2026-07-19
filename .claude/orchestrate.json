@@ -25,7 +25,6 @@
     "closeCommand": "pmtools close"
   },
   "advisory": {
-    "iceSource": "stats/ice-scores.csv",
     "clusterFile": null,
     "sequencingDocRef": null
   },
