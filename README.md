@@ -14,6 +14,9 @@ numbered in a recommended order, from the core engine to the advanced layers.
 [Porting from `fulcrologic/statecharts`](./docs/guide/porting-from-clojure.md) — the naming
 map, the four seams, and the deliberate behavioral divergences.
 
+👉 **Working on this repo (agent or human)?** See [`RULES.md`](./RULES.md) — the house
+conventions for tickets, commits, the pmtools fleet workflow, labels, and the test gate.
+
 See [`init_plan.md`](./init_plan.md) for the full feasibility analysis and roadmap that motivated this port.
 
 ## Status
