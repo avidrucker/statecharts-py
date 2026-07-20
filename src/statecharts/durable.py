@@ -114,6 +114,7 @@ def wm_to_jsonable(wm: WorkingMemory) -> dict:
         "history_value": {k: sorted(v) for k, v in wm.history_value.items()},
         "running": wm.running,
         "initialized": wm.initialized,
+        "dm_initialized": sorted(wm.dm_initialized),
     }
 
 
@@ -124,6 +125,9 @@ def wm_from_jsonable(d: dict) -> WorkingMemory:
         history_value={k: frozenset(v) for k, v in d["history_value"].items()},
         running=d["running"],
         initialized=d["initialized"],
+        # Pre-#38 rows lack this key; default to empty (a state may re-init once on first
+        # post-reload entry) rather than KeyError-ing on legacy sessions.
+        dm_initialized=frozenset(d.get("dm_initialized", ())),
     )
 
 

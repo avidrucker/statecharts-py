@@ -75,7 +75,7 @@ class _Run:
             self.datamodel = dict(wm.datamodel)
             self.history_value = {k: set(v) for k, v in wm.history_value.items()}
             self.running = wm.running
-            self.dm_initialized = set(wm.configuration)
+            self.dm_initialized = set(wm.dm_initialized)
             self.invocations = dict(wm.invocations)
         self.internal_queue: deque = deque()
         self._event: Optional[Event] = None
@@ -101,6 +101,7 @@ class _Run:
             history_value={k: frozenset(v) for k, v in self.history_value.items()},
             running=self.running,
             initialized=True,
+            dm_initialized=frozenset(self.dm_initialized),
             invocations=dict(self.invocations),
         )
 

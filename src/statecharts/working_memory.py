@@ -17,6 +17,11 @@ class WorkingMemory:
     history_value: Dict[str, FrozenSet[str]] = field(default_factory=dict)
     running: bool = False
     initialized: bool = False
+    # States whose <data> has already been applied. Persisted so a datamodel is applied at
+    # most once (early binding: at document start; late binding: on first entry) and survives
+    # across events — NOT reconstructed from the active configuration, which would re-apply
+    # <data> to any state re-entered after being inactive (#38).
+    dm_initialized: FrozenSet[str] = frozenset()
     # Active child invocations (invokeid -> runtime Invocation). NOTE: with live
     # invocations the working memory holds child sessions and is no longer a plain
     # serializable value; see invoke.py.

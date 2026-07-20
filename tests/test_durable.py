@@ -106,6 +106,42 @@ def test_durable_datamodel_persists():
             os.remove(path)
 
 
+def test_durable_datamodel_not_reapplied_after_reload():
+    """Bug #38 (SCP-C-061) at the durable boundary: `dm_initialized` must survive a
+    save->reload, so an early-binding `<data>` value changed while a state is inactive is NOT
+    re-applied when that state is entered after the session is reloaded from the store. Without
+    the durable codec (`wm_to_jsonable`/`wm_from_jsonable`) carrying `dm_initialized`, the field
+    is dropped on reload and the fix regresses: RED before (v resets 5 -> 1 post-reload), GREEN
+    once the codec round-trips it."""
+    from statecharts import handle, ops
+    from statecharts.chart import data_model
+    chart = statechart({"initial": "A"},
+        state({"id": "A"},
+            handle("setv", lambda env, data: [ops.assign("v", 5)]),
+            on("go", "B")),
+        state({"id": "B"}, data_model({"v": 1}), on("back", "A")),
+    )
+    path = tempfile.mktemp(suffix=".scdb")
+    reg = ChartRegistry().register("dm", chart)
+    try:
+        store = SqliteStore(path, clock=ManualClock())
+        rt = DurableRuntime(store, reg)
+        rt.start("dm", "s1")  # early binding: B's <data> applied now, v == 1
+        rt.enqueue("s1", "setv"); rt.tick()
+        assert rt.load("s1").datamodel["v"] == 5, "v set to 5 while B inactive, pre-reload"
+        store.close()
+        # reopen from disk: dm_initialized must have survived the persist/reload
+        store2 = SqliteStore(path, clock=ManualClock())
+        rt2 = DurableRuntime(store2, reg)
+        rt2.enqueue("s1", "go"); rt2.tick()  # enter B for the first time after reload
+        v = rt2.load("s1").datamodel["v"]
+        assert v == 5, f"datamodel re-applied after reload: v was reset to {v!r}, expected 5"
+        store2.close()
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def test_durable_crash_between_claim_and_persist_does_not_lose_event():
     """Bug #21: if the process dies after a timer is claimed but before the resulting
     working memory is persisted, the event must NOT be lost — claim + persist must be
