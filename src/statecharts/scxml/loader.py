@@ -29,6 +29,14 @@ class UnsupportedConstruct(Exception):
     """Raised when a chart uses an SCXML feature this engine doesn't implement."""
 
 
+class InsecureDocument(Exception):
+    """Raised when a document is refused on security grounds, before it is parsed.
+
+    Distinct from :class:`UnsupportedConstruct`, which the conformance runner treats as a
+    *skip*.  An insecure document is a hard failure, never a skip.
+    """
+
+
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
@@ -303,9 +311,48 @@ def _build_root(root_el):
     return root, meta
 
 
+def _reject_doctype(xml_text: str) -> None:
+    """Refuse a document carrying a DTD, *before* it is handed to the parser.
+
+    ``ET.fromstring`` expands internal entities, so a nested-entity DTD ("billion laughs")
+    amplifies its input exponentially — unbounded memory/CPU from untrusted SCXML (#43).
+    ``ET.XMLParser`` exposes no expat entity hook on modern CPython, so the guard is a scan
+    of the *prolog* instead: a DOCTYPE is only well-formed there, and running before the
+    parse means no expansion can occur at all.  SCXML has no use for a DTD, so any DOCTYPE
+    is refused rather than the expansion being bounded.
+    """
+    i = 0
+    n = len(xml_text)
+    if xml_text.startswith("﻿"):  # BOM, else it would end the scan on the first char
+        i = 1
+    while i < n:
+        while i < n and xml_text[i].isspace():
+            i += 1
+        if i >= n or xml_text[i] != "<":
+            return  # not markup; malformed input is the parser's error to report, not ours
+        if xml_text.startswith("<!DOCTYPE", i):
+            raise InsecureDocument(
+                "refusing a document with a DTD: internal entities amplify exponentially "
+                "(billion-laughs). SCXML does not require a DOCTYPE."
+            )
+        if xml_text.startswith("<?", i):  # XML declaration or processing instruction
+            end = xml_text.find("?>", i + 2)
+        elif xml_text.startswith("<!--", i):
+            end = xml_text.find("-->", i + 4)
+        else:
+            return  # the root element — the prolog ended without a DOCTYPE
+        if end == -1:
+            return  # unterminated; again the parser's error to report
+        i = end + (2 if xml_text[i + 1] == "?" else 3)
+
+
 def load_string(xml_text: str):
     """Parse SCXML text. Returns ``(root_StateNode, meta)`` where ``meta`` has
-    ``name`` and ``binding`` ("early"|"late")."""
+    ``name`` and ``binding`` ("early"|"late").
+
+    Raises :class:`InsecureDocument` if the document carries a DTD (see :func:`_reject_doctype`).
+    """
+    _reject_doctype(xml_text)
     return _build_root(ET.fromstring(xml_text))
 
 
