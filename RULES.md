@@ -123,7 +123,7 @@ there is no "tool under repair" caveat; use the `pmtools` commands normally.
 - **G1 — A load-bearing numeric/behavioural assertion gets pinned in `claims-data/` before
   you rely on it** — "a number you did not pin is a number you have already lost." The ledger
   is git-excluded (a working epistemic record); what graduates out is a committed findings
-  doc or an issue. Config: `.claude/orchestrate.json` `claims` block (prefix `SCP`).
+  doc or an issue. Config: `.claude/ledger.json` (prefix `SCP`).
 - **G2 — Situate overloaded terms.** When a headline uses one of `claims.overloadedTerms`
   (`tick`, `store`, `atomic`, `recover`, `defer`, `poison`, `backoff`, `session`, `claim`),
   qualify it (`DurableRuntime.tick`, not bare `tick`) — see `claims-data/README.md`.

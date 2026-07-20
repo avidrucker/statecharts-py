@@ -382,7 +382,7 @@ def test_durable_baseexception_propagates_without_burning_an_attempt():
 
 
 def test_durable_store_error_retries_forever_never_dead_letters():
-    """SCP-C-013 / SCP-C-034: a store/infrastructure error (StoreError from the persistence
+    """SCP-C-013 / SCP-C-034 / SCP-C-023: a store/infrastructure error (StoreError from the persistence
     layer — disk full / db locked / I/O) is NOT the event's fault. tick() rolls it back, leaves
     the event queued (no attempt burned), and does NOT raise — the caller's next poll retries it,
     indefinitely, never counting toward the poison cap and never dead-lettering."""
@@ -582,7 +582,7 @@ def test_store_exec_wraps_sqlite_error_as_store_error():
 
 
 def test_durable_cascade_send_store_failure_follows_executable_content_semantics():
-    """SCP-C-035 (documented limitation): a store failure during a cascade <send> INSIDE
+    """SCP-C-030 / SCP-C-035 (documented limitation): a store failure during a cascade <send> INSIDE
     process_event is caught by the engine's executable-content handling (StoreError is a normal
     Exception) and becomes error.execution — the same semantics as any other bad executable
     content. So the event is still delivered and the failed send is simply not scheduled; it is
@@ -771,7 +771,7 @@ def _fail_once(rt, event_name):
 
 
 def test_durable_same_session_later_event_waits_for_a_failing_earlier_one():
-    """#26 / SCP-C-021 sibling case: two co-due same-session events [P, Q] (P older). If P
+    """SCP-C-046 (#26 / SCP-C-021 sibling case): two co-due same-session events [P, Q] (P older). If P
     transiently fails, Q must NOT be delivered before P succeeds — the session's order is
     preserved under failure. Witness: the chart reaches terminal `c`, which is reachable only
     if P is delivered before Q. RED on main (Q overtakes the backed-off P, so the session
@@ -797,7 +797,7 @@ def test_durable_same_session_later_event_waits_for_a_failing_earlier_one():
 
 
 def test_durable_sibling_inside_backoff_window_does_not_overtake():
-    """SCP-C-020: a same-session sibling scheduled strictly INSIDE the failing head's backoff
+    """SCP-C-047 (fix for SCP-C-020): a same-session sibling scheduled strictly INSIDE the failing head's backoff
     window must not overtake it. P (due now) transiently fails; Q is due 0.5s later — after P
     but before P's ~1s backoff. Without a session gate, Q becomes deliverable while P is parked
     and overtakes it (the exact due-mutation gap that was reverted). With the gate, P's whole
@@ -825,7 +825,7 @@ def test_durable_sibling_inside_backoff_window_does_not_overtake():
 
 
 def test_durable_due_order_beats_id_order_across_a_failure():
-    """SCP-C-021: same-session delivery order is (due, id) even under failure, and the `due`
+    """SCP-C-048 (fix for SCP-C-021): same-session delivery order is (due, id) even under failure, and the `due`
     key dominates the `id` tiebreak. Here Q is enqueued first (lower id) but scheduled LATER
     (due t0+0.5); P is enqueued second (higher id) but due now. Schedule order is P then Q,
     the reverse of id order. P transiently fails. The session must still deliver P before Q
@@ -854,7 +854,7 @@ def test_durable_due_order_beats_id_order_across_a_failure():
 
 
 def test_durable_unknown_session_event_gets_one_attempt_per_tick_not_all_at_once():
-    """#26 review Finding 1: an event to a not-yet-started (sessionless) session must still be
+    """SCP-C-049 (#26 review Finding 1): an event to a not-yet-started (sessionless) session must still be
     retried ONE attempt per fixed-clock tick — the retry gate must apply to sessionless timers
     too. Otherwise a session started even one tick late can never catch an event enqueued before
     it existed, because the orphan burns all DEAD_LETTER_CAP attempts back-to-back in one tick."""
@@ -873,7 +873,7 @@ def test_durable_unknown_session_event_gets_one_attempt_per_tick_not_all_at_once
 
 
 def test_durable_unknown_session_event_is_delivered_by_a_late_start():
-    """#26 review Finding 1: the spaced retry must give a late start() a chance to deliver an
+    """SCP-C-050 (#26 review Finding 1): the spaced retry must give a late start() a chance to deliver an
     event enqueued before the session existed (the documented 'a late start may still deliver
     it', SCP-C-029) — not dead-letter it inside the first tick."""
     store = SqliteStore(":memory:", clock=ManualClock())
@@ -893,7 +893,7 @@ def test_durable_unknown_session_event_is_delivered_by_a_late_start():
 
 
 def test_durable_next_due_reflects_the_retry_gate_not_the_past_due():
-    """#26 review Finding 2: while a session is gated after a failure, next_due() must report the
+    """SCP-C-051 (#26 review Finding 2): while a session is gated after a failure, next_due() must report the
     future retry time — not the failing head's original (now past) due — so a poller that sleeps
     until next_due() waits for the backoff instead of busy-spinning the whole window."""
     store = SqliteStore(":memory:", clock=ManualClock())
@@ -913,7 +913,7 @@ def test_durable_next_due_reflects_the_retry_gate_not_the_past_due():
 
 
 def test_durable_restart_preserves_a_failing_events_backoff():
-    """#26 review round 2, Finding 2: a (re)start must NOT discard the retry backoff of a
+    """SCP-C-052 (#26 review round 2, Finding 2): a (re)start must NOT discard the retry backoff of a
     still-queued failing event. The failing head timer survives a restart (start() re-inits
     working memory but keeps pending timers), so its gate must survive too — otherwise the event
     is retried back-to-back after every restart and dead-lettered prematurely."""
@@ -938,7 +938,7 @@ def test_durable_restart_preserves_a_failing_events_backoff():
 
 
 def test_durable_head_cancel_clears_the_retry_gate():
-    """#26: cancelling the gated *head* timer must clear the retry gate, so a subsequently-
+    """SCP-C-054 (#26): cancelling the gated *head* timer must clear the retry gate, so a subsequently-
     enqueued event is not stranded behind a now-gone head."""
     from statecharts import coerce_event
     store = SqliteStore(":memory:", clock=ManualClock())
@@ -960,7 +960,7 @@ def test_durable_head_cancel_clears_the_retry_gate():
 
 
 def test_durable_unrelated_cancel_does_not_clear_a_failing_heads_gate():
-    """#26 review round 2, Finding 1: cancelling an UNRELATED timer (or a no-match sendid) must
+    """SCP-C-053 (#26 review round 2, Finding 1): cancelling an UNRELATED timer (or a no-match sendid) must
     NOT clear a still-failing head's backoff gate — otherwise repeated unrelated cancels retry
     the head back-to-back and dead-letter it prematurely. Only cancelling the head clears it."""
     from statecharts import coerce_event
@@ -983,7 +983,7 @@ def test_durable_unrelated_cancel_does_not_clear_a_failing_heads_gate():
 
 
 def test_durable_delivers_at_a_negative_clock_epoch():
-    """#26 review round 4, Finding 1: the gate filter must not use 0 as a no-gate sentinel — an
+    """SCP-C-057 (#26 review round 4, Finding 1): the gate filter must not use 0 as a no-gate sentinel — an
     ungated timer must remain deliverable even when the clock reports a negative epoch (a
     ManualClock simulation), which `COALESCE(retry_at,0) <= now` wrongly filtered out."""
     store = SqliteStore(":memory:", clock=ManualClock(start=-10.0))
@@ -998,7 +998,7 @@ def test_durable_delivers_at_a_negative_clock_epoch():
 
 
 def test_durable_cancelling_a_non_head_sibling_keeps_the_gate():
-    """#26 review round 3, Finding 2 (coverage): cancelling a real NON-head sibling (a genuine
+    """SCP-C-056 (#26 review round 3, Finding 2, coverage): cancelling a real NON-head sibling (a genuine
     timer, not a no-match sendid) while the gated head still fails must leave the gate intact."""
     from statecharts import coerce_event
     store = SqliteStore(":memory:", clock=ManualClock())
@@ -1019,7 +1019,7 @@ def test_durable_cancelling_a_non_head_sibling_keeps_the_gate():
 
 
 def test_durable_cancelling_an_earlier_due_sibling_does_not_ungate_the_failing_head():
-    """#26 review round 3, Finding 1: the gate must be owned by the timer that failed, not
+    """SCP-C-055 (#26 review round 3, Finding 1): the gate must be owned by the timer that failed, not
     re-derived as the (due,id)-min head. If a newer event sorts AHEAD of the failing head (a
     clock skew / backward clock adjustment can make due(new) < due(head)), cancelling that newer
     event must NOT clear the still-failing head's gate."""
